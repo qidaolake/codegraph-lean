@@ -202,6 +202,80 @@ describe('Lean 4 extraction', () => {
     expect(cited).not.toContain('hFsc'); // the binder name is NOT
   });
 
+  it('cites where-struct fields on lines the parser discarded', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-dropped-'));
+
+    // tree-sitter's error recovery does not merely mislabel a `where`-struct,
+    // it can drop the tokens outright: in one real witness the tree jumps from
+    // the first field straight past four more, so `isClosed_S :=
+    // b2CarrierS_isClosed` produces NO identifier node anywhere. Those four
+    // lemmas then reported as uncited — which, in a project that uses
+    // zero-inbound to decide what is dead, is the expensive kind of wrong.
+    //
+    // Written with CRLF on purpose. JavaScript's `.` matches neither `\n` nor
+    // `\r`, so a trailing-anchored pattern fails on every line of a CRLF file;
+    // the first version of this rescue silently recovered edges only from the
+    // LF half of a mixed-endings corpus.
+    //
+    // HONEST LIMIT: like the calc test above, this pins the CONTRACT and not
+    // the parser defect. The drop depends on parse state carried from earlier
+    // in a real 1,100-line file — verified by dumping the AST of this exact
+    // fixture, and of a variant with a deliberately malformed preamble, both of
+    // which yield a clean `where_struct` with every `struct_field` present. So
+    // this passes with or without `rescueDroppedFieldLines`; what it guards is
+    // that the right-hand sides stay cited and the field names stay uncited.
+    const crlf = (...lines: string[]): string => lines.join('\r\n') + '\r\n';
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'Defs.lean'),
+      crlf(
+        'def carrierT : Nat := 1',
+        'def carrierS : Nat := 2',
+        'theorem carrierT_isClosed : True := trivial',
+        'theorem carrierS_isClosed : True := trivial',
+        'theorem carrierT_nonempty : True := trivial',
+        'theorem carrierS_nonempty : True := trivial'
+      )
+    );
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'Witness.lean'),
+      crlf(
+        'def demoClass : demoParams.ValueClass2 where',
+        '  carrier_T := carrierT',
+        '  carrier_S := carrierS',
+        '  isClosed_T := carrierT_isClosed',
+        '  isClosed_S := carrierS_isClosed',
+        '  nonempty_T := carrierT_nonempty',
+        '  nonempty_S := carrierS_nonempty',
+        '  sender_unique_on := fun _ hW => senderUnique hW'
+      )
+    );
+
+    const cg = await indexFixture(tmpDir);
+
+    const demo = cg.getNodesByKind('function').find((n) => n.name === 'demoClass');
+    expect(demo).toBeDefined();
+    const cited = citedNames(cg, demo!.id);
+
+    // Every field's right-hand side is a citation; the field names are not.
+    for (const rhs of [
+      'carrierT_isClosed',
+      'carrierS_isClosed',
+      'carrierT_nonempty',
+      'carrierS_nonempty',
+    ]) {
+      expect(cited).toContain(rhs);
+    }
+
+    // And each cited lemma is no longer reported as unused.
+    for (const name of ['carrierS_isClosed', 'carrierS_nonempty']) {
+      const lemma = cg.getNodesByKind('function').find((n) => n.name === name);
+      expect(lemma).toBeDefined();
+      expect(citationsTo(cg, lemma!.id)).toBeGreaterThan(0);
+    }
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

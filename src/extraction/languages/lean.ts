@@ -434,6 +434,124 @@ interface WalkState {
   pendingDoc: string | undefined;
   /** Line -> name declared there, so a binding occurrence is never cited. */
   readonly declLines: ReadonlyMap<number, string>;
+  /** The file's lines, so a declaration can read back rows the parser dropped. */
+  readonly sourceLines: readonly string[];
+}
+
+/**
+ * Split a source file into lines with any trailing CR removed.
+ *
+ * Not cosmetic. JavaScript's `.` does not match `\r` any more than `\n`, so on
+ * a CRLF file a trailing-anchored pattern like `(.+)$` fails on EVERY line —
+ * silently, and only on the half of a mixed-endings corpus that happens to use
+ * CRLF. That is exactly how it presented: the first measurement of
+ * {@link rescueDroppedFieldLines} recovered edges from the LF files and none
+ * at all from the CRLF ones.
+ */
+function splitSourceLines(source: string): string[] {
+  const out = source.split(NEWLINE);
+  for (let i = 0; i < out.length; i++) {
+    const line = out[i] as string;
+    if (line.endsWith(CARRIAGE_RETURN)) out[i] = line.slice(0, -1);
+  }
+  return out;
+}
+
+/**
+ * `field := value` on a line the parser dropped. Group 1 is the value side.
+ *
+ * `!`/`?` are legal in Lean identifiers (`get!`, `find?`) and so is `'`.
+ */
+const FIELD_ASSIGN = /^[ \t]*[A-Za-z_À-￿][A-Za-z0-9_'!?À-￿]*[ \t]*:=[ \t]*(.+)$/;
+
+/** Identifier-shaped tokens inside a dropped line's right-hand side. */
+const RHS_TOKEN = /[A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*/g;
+
+/**
+ * Emit citations from lines the PARSER DISCARDED.
+ *
+ * tree-sitter's error recovery does not merely mislabel a `where`-struct — it
+ * can drop the tokens outright. In one real witness file, `def b2Class :
+ * b2Params.ValueClass2 where` yields a single `struct_field` for line 1069 and
+ * then jumps straight to line 1075: `isClosed_S := b2CarrierS_isClosed` and its
+ * three neighbours produce NO `identifier` node anywhere in the tree. No walk
+ * can recover a token the parser never emitted, so those citations were
+ * invisible — the largest single class of missing citation on a 259-file
+ * development, and the reason four genuinely-used lemmas there reported as
+ * uncited.
+ *
+ * The fallback is the same move `rescueFromErrorSpan` makes for dropped
+ * declarations: read the text. Scoped tightly to keep it honest —
+ *
+ *   - only rows INSIDE this declaration,
+ *   - only the `field := value` shape, whose right-hand side is the citation
+ *     (the left is a field name, a binding position),
+ *   - only tokens the parser produced NO identifier node for, checked per
+ *     TOKEN rather than per row, so a citation can never be emitted twice.
+ *     Per-row was too coarse: on `carrier_S := b2CarrierS` the parser keeps
+ *     `carrier_S` — as an argument of the PREVIOUS line's application — but
+ *     drops `b2CarrierS`, so the row looks covered while the half that is
+ *     actually the citation is the half that went missing.
+ *   - and every token still passes `normalizeRefName` and the locals set.
+ */
+function rescueDroppedFieldLines(
+  decl: SyntaxNode,
+  fromNodeId: string,
+  ctx: ExtractorContext,
+  locals: ReadonlySet<string>,
+  state: WalkState
+): void {
+  const last = Math.min(decl.endPosition.row, state.sourceLines.length - 1);
+
+  // Cheap pre-pass. The overwhelming majority of declarations are theorems with
+  // no `field := value` line anywhere in them, and for those the tree walk
+  // below is pure cost — a second full traversal of every declaration in the
+  // corpus. Scanning the raw lines first keeps this off the hot path.
+  let hasFieldAssign = false;
+  for (let row = decl.startPosition.row; row <= last; row++) {
+    const text = state.sourceLines[row];
+    if (text !== undefined && FIELD_ASSIGN.test(text)) { hasFieldAssign = true; break; }
+  }
+  if (!hasFieldAssign) return;
+
+  const covered = new Map<number, Set<string>>();
+  const mark = (n: SyntaxNode): void => {
+    if (n.type === 'identifier') {
+      const row = n.startPosition.row;
+      const text = getNodeText(n, ctx.source).trim();
+      const bucket = covered.get(row);
+      if (bucket) bucket.add(text); else covered.set(row, new Set([text]));
+    }
+    for (const child of namedChildren(n)) mark(child);
+  };
+  mark(decl);
+
+  for (let row = decl.startPosition.row; row <= last; row++) {
+    const text = state.sourceLines[row];
+    if (text === undefined) continue;
+    const assign = FIELD_ASSIGN.exec(text);
+    if (!assign) continue;
+    const seen = covered.get(row);
+    const rhs = assign[1] as string;
+    // A comment on the value side is prose, not a citation.
+    const code = rhs.split('--')[0] as string;
+    RHS_TOKEN.lastIndex = 0;
+    let token: RegExpExecArray | null;
+    while ((token = RHS_TOKEN.exec(code)) !== null) {
+      const raw = token[0];
+      if (seen?.has(raw)) continue;
+      if (locals.has(raw)) continue;
+      const refName = normalizeRefName(raw);
+      if (refName === null) continue;
+      ctx.addUnresolvedReference({
+        fromNodeId,
+        referenceName: refName,
+        referenceKind: 'calls',
+        line: row + 1,
+        column: token.index,
+      });
+    }
+  }
 }
 
 /** Compose a Lean-style dotted qualified name, honouring `_root_.`. */
@@ -574,6 +692,9 @@ function handleDeclaration(
         emitRefs(child, node.id, ctx, locals, state.declLines);
       }
     }
+
+    // Last: the rows the parser threw away entirely, which no walk can reach.
+    rescueDroppedFieldLines(decl, node.id, ctx, locals, state);
   } finally {
     ctx.popScope();
   }
@@ -667,6 +788,7 @@ const RESCUE_ANONYMOUS: ReadonlySet<string> = new Set(['instance', 'example']);
 
 /** Line separator, built without an escape sequence. */
 const NEWLINE = String.fromCharCode(10);
+const CARRIAGE_RETURN = String.fromCharCode(13);
 
 /** Non-global twin of RESCUE_HEADER, for testing one line at a time. */
 const HEADER_LINE = new RegExp(RESCUE_HEADER.source);
@@ -973,6 +1095,7 @@ export const leanExtractor: LanguageExtractor = {
         handleDeclaration(node, ctx, {
           ns: [], parsedLines: new Set(), sectionLocals: new Set(),
           pendingDoc: undefined, declLines: declaredNameByLine(ctx.source),
+          sourceLines: splitSourceLines(ctx.source),
         });
         return true;
       }
@@ -985,7 +1108,7 @@ export const leanExtractor: LanguageExtractor = {
     const declLines = declaredNameByLine(ctx.source);
     const state: WalkState = {
       ns: [], parsedLines: new Set(), sectionLocals: new Set(),
-      pendingDoc: undefined, declLines,
+      pendingDoc: undefined, declLines, sourceLines: splitSourceLines(ctx.source),
     };
 
     const closeBlock = (): void => {
