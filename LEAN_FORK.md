@@ -181,6 +181,67 @@ from source alone (dot notation needs types, macro-generated names do not exist 
 comparison, Python and Go projects indexed the ordinary way resolve 26–44%, so partial resolution is
 codegraph's normal regime, not a Lean problem.
 
+## Optional: enrich the index from `.ilean` (the elaborated reference graph)
+
+The extractor records what the source text **names**. That is the right contract for an index that
+must work on a tree which does not compile, but it can never see what elaboration decides.
+
+Lean already computes the rest, and `lake build` already wrote it to disk. Every module gets a
+`.ilean` file — **JSON**, despite the Lake docs describing it as a binary LSP blob — holding:
+
+| key | contents |
+|---|---|
+| `decls` | fully-qualified declaration name → source range |
+| `directImports` | the module's imports: the real layering graph |
+| `references` | constant → `[[line, col, line, col, ENCLOSING DECLARATION], …]` |
+
+`references` is the citation graph *after* elaboration, each usage tagged with the declaration that
+contains it — the edge set this extractor spends its heuristics approximating.
+
+```bash
+lake build                                     # .ilean is a build artifact
+node scripts/lean-ilean-enrich.mjs . --dry-run # see what it would add
+node scripts/lean-ilean-enrich.mjs .
+```
+
+Measured on a 259-file development, against the source-only index:
+
+| | source only | + `.ilean` |
+|---|---|---|
+| dependency edges | 59,366 | 89,192 (+17,188 new, 0 removed) |
+| zero-inbound declarations | 1,594 (30.5%) | 1,386 (26.5%) |
+| false "unused" vs elaboration | 249 (15.6%) | 41 (3.0%) |
+
+26.5% is essentially the floor: `.ilean` itself says 25.4% of this project's declarations are cited
+by nothing else in it.
+
+**What it does not cover.** `.ilean` records references the elaborator resolved from *written*
+syntax. A lemma fired by a bare `simp` is written nowhere, so it does not appear — measured at 5 of
+93 `@[simp]` declarations. Those are reachable, but only from the built environment:
+`ConstantInfo.value!.getUsedConstants` does return a simp lemma, provided the rewrite was not
+definitionally true (when `simp` closes a goal by `rfl` the lemma is erased from the proof term).
+That needs a Lean meta-program, not JSON.
+
+**Caveats.**
+
+- Requires a **successful** `lake build`. A stale build means stale edges.
+- Edges are tagged `provenance = 'ilean'`; the script deletes its own previous output first, so
+  re-running is idempotent. `WHERE provenance IS NULL` isolates the source-extracted graph.
+- **Re-indexing rebuilds the edge table and drops them.** Re-run after `codegraph index`, and after
+  the file watcher has fired.
+
+That provenance tag is also the cheapest audit available. On the corpus above, all 13 remaining
+suspicious `Theory/` → `Examples/` edges carry `provenance IS NULL` and none is corroborated by
+`.ilean` — which is the layering claim confirmed from the build rather than argued from a heuristic:
+
+```sql
+SELECT e.provenance, count(*) FROM edges e
+  JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+ WHERE e.kind IN ('calls','instantiates','references')
+   AND s.file_path LIKE '%Theory%' AND t.file_path LIKE '%Examples%'
+ GROUP BY 1;
+```
+
 ## Rebuilding the grammar
 
 Only needed to bump the grammar. No Docker or emscripten required — tree-sitter CLI 0.26+
@@ -211,7 +272,8 @@ answer.
 
 `@[simp]` deserves singling out: an attribute-registered lemma is consumed by `simp` calls that
 never name it, so it is cited constantly and textually invisible. No source-level extractor will
-ever reclassify these. Check the `decorators` column before believing a zero-inbound result.
+ever reclassify these, and neither will `.ilean` (see above). Check the `decorators` column before
+believing a zero-inbound result — or reach for `getUsedConstants`, which does see them.
 
 Dot notation is **partly** covered. When the projection's head is a binder whose type is written
 down in the signature — `(C : p.StandardComplianceLocalCertificate)`, `variable (solution :
