@@ -23,7 +23,30 @@ what the rebase workflow below wants.
 
 ## Setting up on another machine
 
-Requires **Node ≥ 22.5** (the DB backend uses `node:sqlite`; there is no wasm fallback).
+Requires **Node ≥ 22.5 built with FTS5** — and the FTS5 part is the one that bites.
+
+Upstream documents "Node >= 22.5", which is correct for `node:sqlite` *existing*. But the schema
+creates an FTS5 virtual table (`src/db/schema.sql`, `nodes_fts USING fts5`), and Node's bundled
+SQLite was compiled **without** `SQLITE_ENABLE_FTS5` for much of the 22.x line. On such a build,
+indexing dies immediately with:
+
+```
+Failed: no such module: fts5
+```
+
+That is not a fork problem — it fails during `Initializing CodeGraph`, before any Lean code runs.
+Verified: Node 22.21.0 ships SQLite 3.50.4 **with** FTS5; earlier 22.x builds ship 3.47.2 **without**
+it. Check the machine — and the specific shell, since a stale `PATH` or nvm default is a common
+cause:
+
+```bash
+node --version
+node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(':memory:');\
+console.log(d.prepare('select sqlite_version() v').get().v);\
+try{d.exec('CREATE VIRTUAL TABLE t USING fts5(x)');console.log('FTS5 OK')}catch(e){console.log('FTS5 MISSING')}"
+```
+
+Expect `FTS5 OK`. If not, upgrade Node to 22.21.0 or newer.
 
 ```bash
 git clone <your-private-repo-url> codegraph-lean
