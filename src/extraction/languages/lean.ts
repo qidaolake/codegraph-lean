@@ -334,6 +334,91 @@ function processBinders(
   }
 }
 
+/**
+ * Collect every name BOUND inside a subtree — tactic hypotheses and lambda
+ * parameters, not just the declaration's own binders.
+ *
+ * Lean hypothesis names are shaped exactly like lemma names (`hV_T_gain`,
+ * `h_stage_sender`, `hFsc`), so `isLikelyDeclarationRef` cannot tell them
+ * apart. Without this pass a `have h_stage_sender : … := …` emits a reference
+ * at its binding site AND at every later use; if some other file happens to
+ * declare a real theorem of that name each one becomes a WRONG edge, and if
+ * not, a junk `unresolved_refs` row. Measured on a 331-file development: 118
+ * edges crossing from `Theory/`+`Foundations/` into `Examples/` — a layering
+ * violation that would have been alarming had it been real. Every one was a
+ * local hypothesis, and the import graph confirms no such import exists.
+ *
+ * The grammar makes this cheap: `have`/`obtain`/`set`/`let` all parse as
+ * `have` or `let` carrying a `name:` field — either an `identifier` or an
+ * `anon_ctor_binder` holding the destructured names of an `obtain ⟨a, b, c⟩`.
+ * `fun x hx => …` puts bare identifiers under `binders`.
+ *
+ * `intro x hx` and `rcases … with ⟨ha, hb⟩` parse as plain applications, so
+ * their bindings are indistinguishable from arguments and are NOT collected.
+ * That is tolerable because those names are near-universally one or two
+ * characters, which `isLikelyDeclarationRef` already rejects on length.
+ */
+function collectBoundNames(
+  root: SyntaxNode | null,
+  source: string,
+  visit: (name: string, row: number) => void
+): void {
+  if (!root) return;
+
+  // A binding position: a single identifier, or an `obtain`-style destructuring
+  // whose DIRECT identifier children are the bound names. Deliberately does not
+  // recurse further — an `anon_ctor_binder` can contain ERROR nodes (the `-`
+  // placeholder in `⟨a, b, -⟩`) whose descendants are not binding occurrences.
+  const takeName = (n: SyntaxNode | null): void => {
+    if (!n) return;
+    if (n.type === 'identifier') {
+      const text = getNodeText(n, source).trim();
+      // A binding occurrence is always a simple atom. A DOTTED name in binder
+      // position is the grammar misreading an application — the `calc` block
+      // `|U (Sanctions.clipS' (y + h)) - …|` parses as an `explicit_binder`
+      // named `Sanctions.clipS'`. Trusting that suppressed 24 genuine
+      // citations of `clipS'` in one file alone; this guard is what stops the
+      // pass trading one class of wrong answer for another.
+      if (text && !text.includes('.')) visit(text, n.startPosition.row);
+      return;
+    }
+    if (n.type === 'anon_ctor_binder' || n.type === 'anon_ctor') {
+      for (const child of namedChildren(n)) {
+        if (child.type === 'identifier') takeName(child);
+      }
+    }
+  };
+
+  const walk = (node: SyntaxNode): void => {
+    if (node.type === 'have' || node.type === 'let') {
+      takeName(lastField(node, 'name'));
+    } else if (node.type === 'fun') {
+      const host = lastField(node, 'binders') ?? findChildByType(node, 'binders');
+      if (host) {
+        for (const child of namedChildren(host)) {
+          if (child.type === 'identifier') takeName(child);
+          else if (BINDER_TYPES.has(child.type)) for (const nn of allFields(child, 'name')) takeName(nn);
+        }
+      }
+    } else if (BINDER_TYPES.has(node.type) && lastField(node, 'type') !== null) {
+      // Declaration binders. Redundant with `processBinders` on the parsed
+      // path, but the ERROR-span rescue has no binder handling of its own and
+      // this is where it gets it — `(hFsc : SanctionSemiconcave F M)` on a
+      // signature line the grammar could not structure.
+      //
+      // A `type:` field is REQUIRED here because this branch, unlike
+      // `processBinders`, matches a binder node ANYWHERE in the tree rather
+      // than only under the declaration's own `binders` host — so it sees
+      // every parenthesised expression the grammar mislabels as a binder. The
+      // shape this exists to catch is always written `(name : type)`; without
+      // the colon it is an application, not a binding.
+      for (const nn of allFields(node, 'name')) takeName(nn);
+    }
+    for (const child of namedChildren(node)) walk(child);
+  };
+  walk(root);
+}
+
 // ---------------------------------------------------------------------------
 // Declaration handling
 // ---------------------------------------------------------------------------
@@ -443,6 +528,12 @@ function handleDeclaration(
     // own binders. Everything in this set is suppressed as a reference.
     const locals = new Set(state.sectionLocals);
     processBinders(lastField(decl, 'binders') ?? findChildByType(decl, 'binders'), node.id, ctx, locals);
+    // Then every name the PROOF binds — `have`, `obtain`, `set`, `let`, `fun`.
+    // Collected up front over the whole declaration rather than tracked as the
+    // walk descends: a tactic hypothesis is bound for the rest of the proof, so
+    // scope-exact tracking would buy nothing here, and a name bound anywhere in
+    // a declaration is not plausibly also a citation elsewhere in the same one.
+    collectBoundNames(decl, ctx.source, name => locals.add(name));
 
     // `structure Foo extends Bar` — the parent sits as an unlabeled `app`/
     // `identifier` child between the binders and the fields.
@@ -703,6 +794,13 @@ function rescueFromErrorSpan(
   };
   collect(err);
 
+  // Names bound inside the span, by row. The rescue has no binder handling of
+  // its own — it claims every identifier written under a header — so without
+  // this a theorem's own hypothesis `(hFsc : SanctionSemiconcave F M)` is
+  // emitted as a citation from its signature line, and again at every use.
+  const boundRows: Array<{ row: number; name: string }> = [];
+  collectBoundNames(err, ctx.source, (name, row) => { boundRows.push({ row, name }); });
+
   const endLine = err.endPosition.row;
   for (let i = 0; i < found.length; i++) {
     const entry = found[i]!;
@@ -723,6 +821,11 @@ function rescueFromErrorSpan(
     if (!node) continue;
 
     // Identifiers from this header up to the next rescued header belong to it.
+    // Anything this region binds is local to it, exactly as on the parsed path.
+    const locals = new Set<string>();
+    for (const b of boundRows) {
+      if (b.row >= entry.line && b.row < until) locals.add(b.name);
+    }
     ctx.pushScope(node.id);
     try {
       for (let row = entry.line; row < until; row++) {
@@ -738,6 +841,7 @@ function rescueFromErrorSpan(
         for (const id of byLine.get(row) ?? []) {
           const raw = getNodeText(id, ctx.source).trim();
           if (declaredHere !== undefined && declaredHere === raw) continue;
+          if (locals.has(raw)) continue;
           const refName = normalizeRefName(raw);
           if (refName === null || refName === name) continue;
           ctx.addUnresolvedReference({

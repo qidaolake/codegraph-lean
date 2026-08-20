@@ -90,6 +90,34 @@ run `codegraph upgrade`, which is wrong for a fork. Running from a source checko
 `codegraph upgrade` a no-op by design, so it can never overwrite this build — but do **not**
 `npm i -g @colbymchenry/codegraph`, which would.
 
+### The MCP surface is one tool by default — widen it for audit work
+
+`tools/list` advertises **only `codegraph_explore`**. That is upstream's deliberate choice
+(`DEFAULT_MCP_TOOLS = new Set(['explore'])` in `src/mcp/tools.ts`), on the reasoning that every other
+tool is a narrower slice of what explore already does and that their mere presence steers mis-picks.
+
+For a formalization audit that reasoning inverts: `impact`, `callers` and `callees` ARE the
+questions. They stay fully functional and callable, but an agent reading the tool list will never
+discover them. Re-enable the ones you want with an allowlist, which **replaces** the default:
+
+```json
+"env": {
+  "CODEGRAPH_NO_UPDATE_CHECK": "1",
+  "CODEGRAPH_MCP_TOOLS": "explore,impact,callers,callees,node,search"
+}
+```
+
+### Filter edge kinds when you query the database directly
+
+`contains` is an edge. A declaration inside `namespace Foo` always has an inbound `contains` edge
+from the namespace, so **"has an inbound edge" and "is cited" are different questions** — counting
+unfiltered edges makes an uncited lemma look used. Every citation query wants
+`WHERE e.kind IN ('calls','instantiates','references')`.
+
+Attributes are queryable too: `@[simp]` and friends are stored as node decorators, so
+`SELECT name FROM nodes WHERE decorators LIKE '%simp%'` turns "is this lemma load-bearing or just a
+simp lemma?" into a column rather than a manual check.
+
 ## What the delta is
 
 Deliberately small, to keep upstream releases cheap to absorb:
@@ -98,14 +126,15 @@ Deliberately small, to keep upstream releases cheap to absorb:
  M src/types.ts                      +1    'lean' in the LANGUAGES union
  M src/extraction/grammars.ts        +6    wasm file, .lean extension, display name, vendored set
  M src/extraction/languages/index.ts +2    import + EXTRACTORS entry
- ?? src/extraction/languages/lean.ts        the extractor (~880 lines)
+ ?? src/extraction/languages/lean.ts        the extractor (~960 lines)
  ?? src/extraction/wasm/tree-sitter-lean.wasm
+ ?? __tests__/lean-extraction.test.ts       precision contract for the dependency graph
 ```
 
 **Three shared files, eight inserted lines.** Every registration entry is inserted *mid-list* next to
 `kotlin`, never appended at the end — upstream appends new languages at the tail, so appending there
-too would collide on every release. Tests live in their own file rather than upstream's
-high-churn `__tests__/extraction.test.ts`, for the same reason.
+too would collide on every release. Tests live in `__tests__/lean-extraction.test.ts` rather than
+upstream's high-churn `__tests__/extraction.test.ts`, for the same reason.
 
 ## Absorbing an upstream release
 
@@ -162,3 +191,16 @@ typeclass instance resolution, simp-set closure under bare `simp`, coercion inse
 macro-generated declarations, or generalized dot notation (`b.foo` needs the type of `b`). Those are
 decided during elaboration and leave no token behind; for them, Lean's own tooling (`.ilean` files,
 or `getUsedConstants` over a built environment) is the answer.
+
+Dot notation is the limit that bites hardest in practice, because it is how a certificate's fields
+are consumed. `h_stage_sender_on := E.h_stage_sender` is a real citation, but the head `E` is a
+one-character binder, so the reference is dropped rather than risk resolving every `x.val` and `p.δ`
+projection onto a same-named declaration. Consequence: **a lemma consumed only through dot notation
+reports as uncited.** Treat a zero-inbound result as "no *textual* citation", and grep the bare name
+before concluding anything is dead.
+
+Resolution is also **name-based, not import-scoped**: a reference resolves to a same-named node
+anywhere in the project. Where two structures share a field name, the edge can land in the wrong
+file. Measured on a 259-file development after the bound-name fix: 13 such edges remain, all of
+them field-name collisions. So a *layering* query — "does Theory depend on Examples?" — is the one
+question to verify against the import graph rather than trust outright.
