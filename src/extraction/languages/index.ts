@@ -20,6 +20,7 @@ import { phpExtractor } from './php';
 import { rubyExtractor } from './ruby';
 import { swiftExtractor } from './swift';
 import { kotlinExtractor } from './kotlin';
+import { leanExtractor } from './lean';
 import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
@@ -53,6 +54,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   ruby: rubyExtractor,
   swift: swiftExtractor,
   kotlin: kotlinExtractor,
+  lean: leanExtractor,
   dart: dartExtractor,
   pascal: pascalExtractor,
   scala: scalaExtractor,

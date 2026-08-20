@@ -93,6 +93,7 @@ export const LANGUAGES = [
   'ruby',
   'swift',
   'kotlin',
+  'lean',
   'dart',
   'svelte',
   'vue',

@@ -33,6 +33,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   ruby: 'tree-sitter-ruby.wasm',
   swift: 'tree-sitter-swift.wasm',
   kotlin: 'tree-sitter-kotlin.wasm',
+  lean: 'tree-sitter-lean.wasm',
   dart: 'tree-sitter-dart.wasm',
   pascal: 'tree-sitter-pascal.wasm',
   scala: 'tree-sitter-scala.wasm',
@@ -105,6 +106,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.swift': 'swift',
   '.kt': 'kotlin',
   '.kts': 'kotlin',
+  // Lean 4 theorem prover. Vendored grammar (Julian/tree-sitter-lean).
+  '.lean': 'lean',
   '.dart': 'dart',
   '.liquid': 'liquid',
   '.svelte': 'svelte',
@@ -289,7 +292,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'lean', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -631,6 +634,7 @@ export function getLanguageDisplayName(language: Language): string {
     ruby: 'Ruby',
     swift: 'Swift',
     kotlin: 'Kotlin',
+    lean: 'Lean 4',
     dart: 'Dart',
     svelte: 'Svelte',
     vue: 'Vue',

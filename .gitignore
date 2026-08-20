@@ -79,3 +79,6 @@ target-linux/
 .kommandr/kommandr.db
 .kommandr/kommandr.db-wal
 .kommandr/kommandr.db-shm
+
+# Lean fork: local grammar build scratch (not part of the delta)
+vendor-grammars/
