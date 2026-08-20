@@ -726,13 +726,19 @@ function rescueFromErrorSpan(
     ctx.pushScope(node.id);
     try {
       for (let row = entry.line; row < until; row++) {
-        // Stop at the next declaration header, even one the parser already
-        // handled and the rescue therefore skipped. Without this bound a rescued
-        // declaration claims the identifiers of every declaration the cascade
-        // swallowed after it — including each one's own name at its own header.
-        if (row > entry.line && declLines.has(row)) break;
+        // A declaration's own name at its own header is a BINDING occurrence,
+        // so suppress just that token — do NOT stop the walk here. An earlier
+        // version broke out of the range at any header line, which orphaned
+        // every region whose header the rescue itself skips (already parsed,
+        // inside a comment, anonymous): nobody walked it and its citations were
+        // emitted by no one. That cost ~8 genuine declarations their last
+        // inbound edge against ~133 artifacts removed — a net gain, but the
+        // wrong shape of fix. Suppress the token, keep the coverage.
+        const declaredHere = declLines.get(row);
         for (const id of byLine.get(row) ?? []) {
-          const refName = normalizeRefName(getNodeText(id, ctx.source).trim());
+          const raw = getNodeText(id, ctx.source).trim();
+          if (declaredHere !== undefined && declaredHere === raw) continue;
+          const refName = normalizeRefName(raw);
           if (refName === null || refName === name) continue;
           ctx.addUnresolvedReference({
             fromNodeId: node.id,
