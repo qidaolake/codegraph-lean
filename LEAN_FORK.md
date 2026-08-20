@@ -46,7 +46,21 @@ console.log(d.prepare('select sqlite_version() v').get().v);\
 try{d.exec('CREATE VIRTUAL TABLE t USING fts5(x)');console.log('FTS5 OK')}catch(e){console.log('FTS5 MISSING')}"
 ```
 
-Expect `FTS5 OK`. If not, upgrade Node to 22.21.0 or newer.
+Expect `FTS5 OK`. If not, upgrade Node — but **upgrade into a window, not forward**.
+
+Upstream's `engines` is `>=20.0.0 <25.0.0`, so the usable range is **Node 22.21+ or 24.x, and
+nothing at 25 or above**. On Windows this matters concretely: winget's default `OpenJS.NodeJS`
+package is currently 26.x and out of range. Install `OpenJS.NodeJS.LTS` instead.
+
+| Node | Bundled SQLite | FTS5 | In `engines` range |
+|---|---|---|---|
+| 22.14 | 3.47.2 | no | yes |
+| 22.21 | 3.50.4 | **yes** | yes |
+| 24.19 | 3.53.3 | **yes** | yes |
+| 26.x | — | yes | **no** |
+
+Upstream never hits the FTS5 problem because its installer ships a bundled Node; building this fork
+from source uses the system Node instead.
 
 ```bash
 git clone <your-private-repo-url> codegraph-lean

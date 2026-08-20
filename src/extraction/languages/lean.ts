@@ -112,7 +112,7 @@ const SORRY_AX = 'sorryAx';
  * Tuned to be QUIET: a missed reference costs one edge, a false one pollutes
  * every impact query that passes through it.
  */
-function isLikelyDeclarationRef(name: string): boolean {
+function isLikelyDeclarationRef(name: string, inLemmaList = false): boolean {
   if (name.length < 3) return false;
   if (TACTIC_STOPWORDS.has(name)) return false;
 
@@ -136,7 +136,14 @@ function isLikelyDeclarationRef(name: string): boolean {
   // for a whole category of declaration. Require an interior capital and length
   // >= 4 so lowercase tactic words (`simp`, `omega`, `aesop`) still fall out.
   if (name.includes('_') || /^[A-Z]/.test(name)) return true;
-  return name.length >= 4 && /^[a-z][A-Za-z0-9]*[A-Z]/.test(name);
+  if (name.length >= 4 && /^[a-z][A-Za-z0-9]*[A-Z]/.test(name)) return true;
+  // Plain all-lowercase (`b2clip`, `sqrt`, `deriv`) is a legitimate Lean
+  // definition shape, but accepting it everywhere is a bad trade: measured at
+  // +1,060 edges against +13,009 junk rows, because local hypothesis names
+  // share the shape and can collide with a real declaration to make a WRONG
+  // edge. Inside a tactic's bracketed lemma list it is safe — `norm_num
+  // [b2sdyn, b2pt, b2clip, b2lam]` names four lemmas and nothing else.
+  return inLemmaList && /^[a-z][a-z0-9]*$/.test(name);
 }
 
 /**
@@ -147,13 +154,13 @@ function isLikelyDeclarationRef(name: string): boolean {
  * then missed — leaving 704 `_root_.`-prefixed junk rows on mathlib that the
  * main path had already been fixed to strip.
  */
-function normalizeRefName(name: string): string | null {
+function normalizeRefName(name: string, inLemmaList = false): string | null {
   if (!name || name === '_root_') return null;
   // `_root_.Foo.bar` names a symbol absolutely, escaping the enclosing
   // namespace. `qualify` strips the marker from declaration names, so the
   // reference must be stripped identically or it can never match.
   const bare = name.startsWith('_root_.') ? name.slice('_root_.'.length) : name;
-  return isLikelyDeclarationRef(bare) ? bare : null;
+  return isLikelyDeclarationRef(bare, inLemmaList) ? bare : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +251,7 @@ function emitRefs(
 ): void {
   if (!subtree) return;
 
-  const walk = (node: SyntaxNode): void => {
+  const walk = (node: SyntaxNode, inLemmaList: boolean): void => {
     if (node.type === 'identifier') {
       const name = getNodeText(node, ctx.source).trim();
       if (name && !locals.has(name)) {
@@ -256,7 +263,7 @@ function emitRefs(
         // has to be stripped the same way `qualify` strips it from declaration
         // names — otherwise a `_root_.Foo.bar` citation can never match the node
         // stored as `Foo.bar`.
-        const bare = normalizeRefName(name);
+        const bare = normalizeRefName(name, inLemmaList);
         if (bare === null) return;
         ctx.addUnresolvedReference({ fromNodeId, referenceName: bare, referenceKind: 'calls', line, column });
         // `dualParams.F` / `lowDeltaShocked.smear` are dot notation: the head is
@@ -267,7 +274,7 @@ function emitRefs(
         const dot = bare.indexOf('.');
         if (dot > 2) {
           const head = bare.slice(0, dot);
-          if (head !== '_root_' && !locals.has(head) && isLikelyDeclarationRef(head)) {
+          if (head !== '_root_' && !locals.has(head) && isLikelyDeclarationRef(head, inLemmaList)) {
             ctx.addUnresolvedReference({ fromNodeId, referenceName: head, referenceKind: 'calls', line, column });
           }
         }
@@ -294,11 +301,12 @@ function emitRefs(
       // A declaration nested inside this subtree (typically one swallowed by an
       // ERROR span) owns its own citations — attributing them to the enclosing
       // declaration would invent dependencies it does not have.
-      if (child && !DECL_KINDS.has(child.type)) walk(child);
+      // `[foo, bar]` after a tactic is a lemma list, not an expression.
+      if (child && !DECL_KINDS.has(child.type)) walk(child, inLemmaList || node.type === 'list_lit');
     }
   };
 
-  walk(subtree);
+  walk(subtree, false);
 }
 
 /** Collect binder names (binding occurrences) and emit refs from their TYPES. */
