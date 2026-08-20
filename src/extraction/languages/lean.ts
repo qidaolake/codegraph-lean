@@ -567,6 +567,35 @@ const RESCUE_KINDS: ReadonlyMap<string, NodeKind> = new Map<string, NodeKind>([
 /** Declaration keywords that are legitimately anonymous (`instance : C X where`). */
 const RESCUE_ANONYMOUS: ReadonlySet<string> = new Set(['instance', 'example']);
 
+/**
+ * Per-line flag: does this line BEGIN inside a `/- ... -/` block comment?
+ *
+ * The text-level rescue matches declaration headers at column 0, and Lean prose
+ * wraps: "...its three-goals" / "theorem routes Step 1..." puts `theorem` at
+ * column 0 inside a comment, and the rescue then mints a declaration called
+ * `routes`. Measured at 8 of 3,771 declarations (0.21%) on a real development --
+ * all with a null signature, none absorbing an inbound edge, but all landing in
+ * the zero-inbound pool that the unused-declaration question reads.
+ */
+function blockCommentLineFlags(source: string): Uint8Array {
+  const lines = source.split(/\r?\n/);
+  const flags = new Uint8Array(lines.length);
+  let depth = 0;
+  for (let i = 0; i < lines.length; i++) {
+    flags[i] = depth > 0 ? 1 : 0;
+    const line = lines[i] ?? '';
+    let opens = 0;
+    let closes = 0;
+    for (let j = 0; j + 1 < line.length; j++) {
+      if (line[j] === '/' && line[j + 1] === '-') opens++;
+      else if (line[j] === '-' && line[j + 1] === '/') closes++;
+    }
+    depth += opens - closes;
+    if (depth < 0) depth = 0;
+  }
+  return flags;
+}
+
 /** Every ERROR node in a subtree, outermost first. */
 function errorSpans(root: SyntaxNode): SyntaxNode[] {
   const out: SyntaxNode[] = [];
@@ -588,7 +617,8 @@ function rescueFromErrorSpan(
   err: SyntaxNode,
   ns: readonly string[],
   ctx: ExtractorContext,
-  seenLines: Set<number>
+  seenLines: Set<number>,
+  commentLines: Uint8Array
 ): void {
   const text = ctx.source.slice(err.startIndex, err.endIndex);
   const baseLine = err.startPosition.row;
@@ -606,6 +636,8 @@ function rescueFromErrorSpan(
     const kind = RESCUE_KINDS.get(keyword);
     if (!kind) continue;
     const line = baseLine + (text.slice(0, m.index).match(/\n/g)?.length ?? 0);
+    // Prose inside a block comment is not a declaration, however it wraps.
+    if (commentLines[line] === 1) continue;
     // `instance : Foo where` and `example :` carry no name; that was the
     // largest remaining rescue gap (11.4% of FLT's instances), because the
     // header pattern demanded an identifier. Name them positionally, exactly
@@ -902,8 +934,11 @@ export const leanExtractor: LanguageExtractor = {
     // context is gone by now, which is why rescued names take the prefix that
     // was open at their own position — recorded when the span was queued.
     const seenLines = new Set(state.parsedLines);
+    const commentLines = pendingRescue.length > 0
+      ? blockCommentLineFlags(ctx.source)
+      : new Uint8Array(0);
     for (const { err, ns } of pendingRescue) {
-      rescueFromErrorSpan(err, ns, ctx, seenLines);
+      rescueFromErrorSpan(err, ns, ctx, seenLines, commentLines);
     }
     return true;
   },
