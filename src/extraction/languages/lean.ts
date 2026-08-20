@@ -247,13 +247,18 @@ function emitRefs(
   subtree: SyntaxNode | null,
   fromNodeId: string,
   ctx: ExtractorContext,
-  locals: ReadonlySet<string>
+  locals: ReadonlySet<string>,
+  declLines?: ReadonlyMap<number, string>
 ): void {
   if (!subtree) return;
 
   const walk = (node: SyntaxNode, inLemmaList: boolean): void => {
     if (node.type === 'identifier') {
       const name = getNodeText(node, ctx.source).trim();
+      // A declaration's own name at its own header is a binding occurrence, not
+      // a citation. Without this, a declaration swallowed into a neighbour's
+      // ERROR span gets a fabricated inbound edge from that neighbour.
+      if (declLines !== undefined && declLines.get(node.startPosition.row) === name) return;
       if (name && !locals.has(name)) {
         const line = node.startPosition.row + 1;
         const column = node.startPosition.column;
@@ -342,6 +347,8 @@ interface WalkState {
   readonly sectionLocals: Set<string>;
   /** Docstring seen immediately before the current declaration. */
   pendingDoc: string | undefined;
+  /** Line -> name declared there, so a binding occurrence is never cited. */
+  readonly declLines: ReadonlyMap<number, string>;
 }
 
 /** Compose a Lean-style dotted qualified name, honouring `_root_.`. */
@@ -442,12 +449,12 @@ function handleDeclaration(
     const fieldOffsets = fieldChildOffsets(decl);
     for (const child of namedChildren(decl)) {
       if (child.type === 'app' && !fieldOffsets.has(child.startIndex)) {
-        emitRefs(child, node.id, ctx, locals);
+        emitRefs(child, node.id, ctx, locals, state.declLines);
       }
     }
 
     // The statement / return type. For a theorem this IS the content.
-    emitRefs(lastField(decl, 'type'), node.id, ctx, locals);
+    emitRefs(lastField(decl, 'type'), node.id, ctx, locals, state.declLines);
 
     // Members: structure fields and inductive constructors.
     for (const child of namedChildren(decl)) {
@@ -462,18 +469,18 @@ function handleDeclaration(
     //   `:= term` / `:= by tactics`  → the `body` field
     //   `where` struct instances     → `where_struct` children
     //   equation-style `| pat => e`  → `match_alt` children
-    emitRefs(bodyNode, node.id, ctx, locals);
+    emitRefs(bodyNode, node.id, ctx, locals, state.declLines);
     for (const child of namedChildren(decl)) {
       if (child.type === 'where_struct') {
         for (const sf of namedChildren(child)) {
-          if (sf.type === 'struct_field') emitRefs(lastField(sf, 'value'), node.id, ctx, locals);
+          if (sf.type === 'struct_field') emitRefs(lastField(sf, 'value'), node.id, ctx, locals, state.declLines);
         }
       } else if (child.type === 'match_alt') {
-        emitRefs(lastField(child, 'body') ?? child, node.id, ctx, locals);
+        emitRefs(lastField(child, 'body') ?? child, node.id, ctx, locals, state.declLines);
       } else if (child.type === 'where_aux_def' || child.type === 'ERROR') {
         // `where`-bound auxiliary definitions, and anything the grammar could
         // not structure — both still carry real citations.
-        emitRefs(child, node.id, ctx, locals);
+        emitRefs(child, node.id, ctx, locals, state.declLines);
       }
     }
   } finally {
@@ -567,6 +574,12 @@ const RESCUE_KINDS: ReadonlyMap<string, NodeKind> = new Map<string, NodeKind>([
 /** Declaration keywords that are legitimately anonymous (`instance : C X where`). */
 const RESCUE_ANONYMOUS: ReadonlySet<string> = new Set(['instance', 'example']);
 
+/** Line separator, built without an escape sequence. */
+const NEWLINE = String.fromCharCode(10);
+
+/** Non-global twin of RESCUE_HEADER, for testing one line at a time. */
+const HEADER_LINE = new RegExp(RESCUE_HEADER.source);
+
 /**
  * Per-line flag: does this line BEGIN inside a `/- ... -/` block comment?
  *
@@ -596,6 +609,32 @@ function blockCommentLineFlags(source: string): Uint8Array {
   return flags;
 }
 
+/**
+ * Map of 0-based line number to the declaration name written on that line.
+ *
+ * A declaration's own name at its own definition site is a BINDING occurrence,
+ * never a citation. When a parse cascade swallows declaration Y into another
+ * declaration's ERROR span, the reference walker would otherwise harvest Y's
+ * name from its own header and emit it as a citation — inventing an inbound
+ * edge for Y and hiding that nothing actually uses it. Measured at 419 such
+ * edges on a real development, each one masking its target's true inbound count,
+ * which is exactly what the unused-declaration question reads.
+ *
+ * Serves two purposes: suppressing those harvests, and bounding how far a
+ * rescued declaration may claim identifiers (it stops at the next header).
+ */
+function declaredNameByLine(source: string): Map<number, string> {
+  const out = new Map<number, string>();
+  const lines = source.split(NEWLINE);
+  for (let i = 0; i < lines.length; i++) {
+    HEADER_LINE.lastIndex = 0;
+    const m = HEADER_LINE.exec(lines[i] ?? '');
+    // Group 1 is the KEYWORD, group 2 is the declared name.
+    if (m && m[2]) out.set(i, m[2]);
+  }
+  return out;
+}
+
 /** Every ERROR node in a subtree, outermost first. */
 function errorSpans(root: SyntaxNode): SyntaxNode[] {
   const out: SyntaxNode[] = [];
@@ -618,7 +657,8 @@ function rescueFromErrorSpan(
   ns: readonly string[],
   ctx: ExtractorContext,
   seenLines: Set<number>,
-  commentLines: Uint8Array
+  commentLines: Uint8Array,
+  declLines: ReadonlyMap<number, string>
 ): void {
   const text = ctx.source.slice(err.startIndex, err.endIndex);
   const baseLine = err.startPosition.row;
@@ -686,6 +726,11 @@ function rescueFromErrorSpan(
     ctx.pushScope(node.id);
     try {
       for (let row = entry.line; row < until; row++) {
+        // Stop at the next declaration header, even one the parser already
+        // handled and the rescue therefore skipped. Without this bound a rescued
+        // declaration claims the identifiers of every declaration the cascade
+        // swallowed after it — including each one's own name at its own header.
+        if (row > entry.line && declLines.has(row)) break;
         for (const id of byLine.get(row) ?? []) {
           const refName = normalizeRefName(getNodeText(id, ctx.source).trim());
           if (refName === null || refName === name) continue;
@@ -816,7 +861,8 @@ export const leanExtractor: LanguageExtractor = {
       // here rather than let the generic path mint a mis-named node.
       if (DECL_KINDS.has(node.type)) {
         handleDeclaration(node, ctx, {
-          ns: [], parsedLines: new Set(), sectionLocals: new Set(), pendingDoc: undefined,
+          ns: [], parsedLines: new Set(), sectionLocals: new Set(),
+          pendingDoc: undefined, declLines: declaredNameByLine(ctx.source),
         });
         return true;
       }
@@ -826,7 +872,11 @@ export const leanExtractor: LanguageExtractor = {
     interface Block { kind: 'namespace' | 'section'; pushedScope: boolean; savedLocals: Set<string> }
     const blocks: Block[] = [];
     const pendingRescue: Array<{ err: SyntaxNode; ns: string[] }> = [];
-    const state: WalkState = { ns: [], parsedLines: new Set(), sectionLocals: new Set(), pendingDoc: undefined };
+    const declLines = declaredNameByLine(ctx.source);
+    const state: WalkState = {
+      ns: [], parsedLines: new Set(), sectionLocals: new Set(),
+      pendingDoc: undefined, declLines,
+    };
 
     const closeBlock = (): void => {
       const block = blocks.pop();
@@ -938,7 +988,7 @@ export const leanExtractor: LanguageExtractor = {
       ? blockCommentLineFlags(ctx.source)
       : new Uint8Array(0);
     for (const { err, ns } of pendingRescue) {
-      rescueFromErrorSpan(err, ns, ctx, seenLines, commentLines);
+      rescueFromErrorSpan(err, ns, ctx, seenLines, commentLines, state.declLines);
     }
     return true;
   },
