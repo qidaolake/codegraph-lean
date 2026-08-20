@@ -276,6 +276,118 @@ describe('Lean 4 extraction', () => {
     }
   });
 
+  it('keeps the field after one whose type contains |…|', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-pipes-'));
+
+    // A field whose type contains absolute-value bars opens an ERROR; the
+    // parser then resumes MID-FIELD and files the next field's name under the
+    // previous field's `binders`. The successor vanished from the index
+    // entirely — silent, and every query about it answered confidently about
+    // nothing. Absolute value in a hypothesis is ordinary mathematics, so this
+    // is not specific to any development.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Repro.lean'),
+      'structure A where\n' +
+        '  before : Nat\n' +
+        '  multiLineNoPipes :\n' +
+        '    ∀ x : Nat,\n' +
+        '      x = x\n' +
+        '  afterPlain : Nat\n' +
+        '  multiLineWithPipes :\n' +
+        '    ∀ x y : Nat,\n' +
+        '      |(x : Int) - (y : Int)| ≤ 0\n' +
+        '  afterPipes : Nat\n' +
+        '  tail : Nat\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const fields = cg.getNodesByKind('field').map((n) => n.name);
+
+    expect(fields).toContain('afterPipes');
+    // The plain multi-line field is the control: it never regressed, and its
+    // successor must keep working.
+    expect(fields).toContain('afterPlain');
+    expect(fields).toEqual(
+      expect.arrayContaining([
+        'before',
+        'multiLineNoPipes',
+        'afterPlain',
+        'multiLineWithPipes',
+        'afterPipes',
+        'tail',
+      ])
+    );
+
+    // Reported at its OWN line, not the swallowing field's.
+    const afterPipes = cg.getNodesByKind('field').find((n) => n.name === 'afterPipes');
+    expect(afterPipes?.startLine).toBe(10);
+  });
+
+  it('never treats a field binder as a second field', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-binder-field-'));
+
+    // The guard on the fix above. Recovering a swallowed field means reading
+    // names out of a `binders` slot, and everything else in that slot must
+    // stay out of the index.
+    //
+    // Lean 4 does NOT support the grouped form `alpha beta : Nat` — verified
+    // against 4.29, which rejects it with "failed to infer type of binder
+    // `beta`". Anything sharing a field's line is a BINDER of that field. An
+    // earlier version of the fix assumed the Lean 3 reading and minted a
+    // spurious field for the parameter of every `tendsto_mul_left m : …` in
+    // mathlib.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Binders.lean'),
+      'structure Params where\n' +
+        '  tendsto_mul_left m : Nat\n' +
+        '  star_inner x y : Nat\n' +
+        '  real_field : Nat\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const fields = cg.getNodesByKind('field').map((n) => n.name);
+
+    expect(fields).toContain('tendsto_mul_left');
+    expect(fields).toContain('real_field');
+    for (const binder of ['m', 'x', 'y']) expect(fields).not.toContain(binder);
+  });
+
+  it('never mints a keyword, command or docstring word as a field', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-debris-'));
+
+    // The other half of the guard. A cascade sweeps whatever follows into the
+    // same `binders` slot; measured across mathlib4 and batteries, an earlier
+    // rule minted `end`, `export`, `namespace`, `apply`, `at`, `attribute` and
+    // individual docstring words as structure fields.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Debris.lean'),
+      'namespace Demo\n' +
+        '\n' +
+        'structure S where\n' +
+        '  chord : ∀ x y : Nat, |(x : Int) - (y : Int)| ≤ 0\n' +
+        '  genuine : Nat\n' +
+        '\n' +
+        '/-- More precisely, it does so in a relative setting:\n' +
+        'Then the Leibniz rule asserts for all `x : L` that -/\n' +
+        'variable {R : Type} {A : Type}\n' +
+        '\n' +
+        'attribute [simp] Demo.S.genuine\n' +
+        '\n' +
+        'end Demo\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const fields = cg.getNodesByKind('field').map((n) => n.name);
+
+    expect(fields).toContain('genuine');
+    for (const debris of [
+      'end', 'export', 'namespace', 'attribute', 'variable',
+      'More', 'Then', 'Leibniz', 'asserts', 'setting', 'R', 'A',
+    ]) {
+      expect(fields).not.toContain(debris);
+    }
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

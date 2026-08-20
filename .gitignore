@@ -82,3 +82,6 @@ target-linux/
 
 # Lean fork: local grammar build scratch (not part of the delta)
 vendor-grammars/
+
+# local grammar/AST probes
+/*dbg.mjs

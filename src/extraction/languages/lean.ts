@@ -436,6 +436,8 @@ interface WalkState {
   readonly declLines: ReadonlyMap<number, string>;
   /** The file's lines, so a declaration can read back rows the parser dropped. */
   readonly sourceLines: readonly string[];
+  /** Per-row flag: is this line inside a `/- -/` block? Prose is not code. */
+  readonly commentLines: Uint8Array;
 }
 
 /**
@@ -494,6 +496,43 @@ const RHS_TOKEN = /[A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*/g;
  *     actually the citation is the half that went missing.
  *   - and every token still passes `normalizeRefName` and the locals set.
  */
+function emitFieldAssignRefs(
+  fromNodeId: string,
+  startRow: number,
+  endRow: number,
+  covered: ReadonlyMap<number, ReadonlySet<string>>,
+  sourceLines: readonly string[],
+  locals: ReadonlySet<string>,
+  ctx: ExtractorContext
+): void {
+  for (let row = startRow; row <= endRow; row++) {
+    const text = sourceLines[row];
+    if (text === undefined) continue;
+    const assign = FIELD_ASSIGN.exec(text);
+    if (!assign) continue;
+    const seen = covered.get(row);
+    const rhs = assign[1] as string;
+    // A comment on the value side is prose, not a citation.
+    const code = rhs.split('--')[0] as string;
+    RHS_TOKEN.lastIndex = 0;
+    let token: RegExpExecArray | null;
+    while ((token = RHS_TOKEN.exec(code)) !== null) {
+      const raw = token[0];
+      if (seen?.has(raw)) continue;
+      if (locals.has(raw)) continue;
+      const refName = normalizeRefName(raw);
+      if (refName === null) continue;
+      ctx.addUnresolvedReference({
+        fromNodeId,
+        referenceName: refName,
+        referenceKind: 'calls',
+        line: row + 1,
+        column: token.index,
+      });
+    }
+  }
+}
+
 function rescueDroppedFieldLines(
   decl: SyntaxNode,
   fromNodeId: string,
@@ -526,32 +565,9 @@ function rescueDroppedFieldLines(
   };
   mark(decl);
 
-  for (let row = decl.startPosition.row; row <= last; row++) {
-    const text = state.sourceLines[row];
-    if (text === undefined) continue;
-    const assign = FIELD_ASSIGN.exec(text);
-    if (!assign) continue;
-    const seen = covered.get(row);
-    const rhs = assign[1] as string;
-    // A comment on the value side is prose, not a citation.
-    const code = rhs.split('--')[0] as string;
-    RHS_TOKEN.lastIndex = 0;
-    let token: RegExpExecArray | null;
-    while ((token = RHS_TOKEN.exec(code)) !== null) {
-      const raw = token[0];
-      if (seen?.has(raw)) continue;
-      if (locals.has(raw)) continue;
-      const refName = normalizeRefName(raw);
-      if (refName === null) continue;
-      ctx.addUnresolvedReference({
-        fromNodeId,
-        referenceName: refName,
-        referenceKind: 'calls',
-        line: row + 1,
-        column: token.index,
-      });
-    }
-  }
+  emitFieldAssignRefs(
+    fromNodeId, decl.startPosition.row, last, covered, state.sourceLines, locals, ctx
+  );
 }
 
 /** Compose a Lean-style dotted qualified name, honouring `_root_.`. */
@@ -668,9 +684,9 @@ function handleDeclaration(
     // Members: structure fields and inductive constructors.
     for (const child of namedChildren(decl)) {
       if (child.type === 'field' || child.type === 'struct_field') {
-        emitMember(child, 'field', ctx, locals, qualifiedName);
+        emitMember(child, 'field', ctx, locals, qualifiedName, state.commentLines);
       } else if (child.type === 'ctor' || child.type === 'ctor_alt') {
-        emitMember(child, 'enum_member', ctx, locals, qualifiedName);
+        emitMember(child, 'enum_member', ctx, locals, qualifiedName, state.commentLines);
       }
     }
 
@@ -738,20 +754,158 @@ function emitMember(
   kind: NodeKind,
   ctx: ExtractorContext,
   locals: ReadonlySet<string>,
-  ownerQualifiedName: string
+  ownerQualifiedName: string,
+  commentLines: Uint8Array
 ): void {
   const nameNode = lastField(member, 'name');
   if (!nameNode) return;
-  const name = getNodeText(nameNode, ctx.source).trim();
-  if (!name) return;
+  const typeNode = lastField(member, 'type');
 
-  // Dotted, like every other Lean name — the core would compose `A::B::c`.
-  const node = ctx.createNode(kind, name, member, {
-    qualifiedName: ownerQualifiedName ? `${ownerQualifiedName}.${name}` : name,
-  });
-  if (!node) return;
-  // The field's TYPE is its dependency; its own name is a binding occurrence.
-  emitRefs(lastField(member, 'type'), node.id, ctx, locals);
+  const emitOne = (idNode: SyntaxNode): void => {
+    const name = getNodeText(idNode, ctx.source).trim();
+    if (!name) return;
+    // Dotted, like every other Lean name — the core would compose `A::B::c`.
+    // Anchor each name on its OWN line: when the second name is really a
+    // separate field the grammar mis-attached (see below), reporting it at the
+    // first field's line would send every `file:line` answer to the wrong row.
+    const node = ctx.createNode(kind, name, member, {
+      qualifiedName: ownerQualifiedName ? `${ownerQualifiedName}.${name}` : name,
+      startLine: idNode.startPosition.row + 1,
+      endLine: member.endPosition.row + 1,
+    });
+    if (!node) return;
+    // The field's TYPE is its dependency; its own name is a binding occurrence.
+    emitRefs(typeNode, node.id, ctx, locals);
+  };
+
+  emitOne(nameNode);
+
+  // `structure A where a b : Nat` declares TWO fields sharing one type, and the
+  // grammar puts every name after the first in a `binders` child. Reading only
+  // `name:` dropped all but the first — silently, since the structure and its
+  // other fields all extract fine.
+  //
+  // The same shape is how a field typed with `|…|` swallows its successor. On
+  //
+  //   multiLineWithPipes :
+  //     ∀ x y : Nat, |(x : Int) - (y : Int)| ≤ 0
+  //   afterPipes : Nat
+  //
+  // the `|` opens an ERROR, the parser resumes mid-field, and `afterPipes`
+  // lands in this same `binders` slot — indistinguishable from multi-name
+  // syntax, and recovered by the same code. That mattered in practice: a
+  // sanction-chord field written `|p.F x s₂ - p.F x s₁| ≤ d * (s₂ - s₁)` sits
+  // in two certificate structures of one development, and the field after it
+  // in each — including `hS_margin`, among the most-queried in the tree — was
+  // absent from the index entirely.
+  //
+  // Only for structure fields: an inductive constructor's `binders` are real
+  // parameters, not extra constructor names. Bare identifiers only, so a
+  // genuine parameter list (`myMethod (x : Nat) : Nat`) is left alone.
+  if (kind !== 'field') return;
+  const extraNames = findChildByType(member, 'binders');
+  if (!extraNames) return;
+  for (const child of namedChildren(extraNames)) {
+    if (child.type !== 'identifier') continue;
+    // The `binders` slot also collects whatever the ERROR recovery swept up.
+    // Two properties separate a field name from that debris, and neither is
+    // specific to any one project: a field name is never DOTTED, and it always
+    // sits to the LEFT of its type ascription.
+    //
+    //   ∀ s ∈ I, |p.U_T x a s| ≤ cube_T          no ascription — an expression
+    //   attribute [to_dual existing] Order.toMax  no ascription — a command
+    //   le_total := LinearOrder.le_total          `:=` assigns, never declares
+    //   end / export / namespace / refine / at    keywords, no ascription
+    //   cube_S : ℝ                                a field
+    //
+    // An earlier version accepted anything that opened its own line. That held
+    // on the one development the bug was reported against and failed
+    // everywhere else: measured across mathlib4 and batteries it minted `end`,
+    // `export`, `namespace`, `apply`, `at` and `attribute` as structure fields.
+    //
+    // The name must also OPEN its own line. Anything sharing the field's line
+    // is a BINDER of that field, never a second field — confirmed against Lean
+    // 4.29, which rejects
+    //
+    //   structure Multi where
+    //     alpha beta : Nat
+    //
+    // with "failed to infer type of binder `beta`". Lean 3 allowed the grouped
+    // form and Lean 4 does not; assuming it did minted a spurious field for the
+    // parameter of every `tendsto_mul_left m : …` declaration in mathlib.
+    if (!isFirstTokenOnLine(child, ctx.source)) continue;
+    const text = getNodeText(child, ctx.source);
+    if (text.includes('.')) continue;
+    if (LEAN_KEYWORDS.has(text)) continue;
+    if (!precedesTypeAscription(child, ctx.source)) continue;
+    const line = sourceLineOf(child, ctx.source);
+    // A declaration header ascribes too (`theorem foo : True`), as does a
+    // command (`variable {R : Type u}`, `attribute [simp] Foo.bar`). Both pass
+    // the test above and must be excluded by the line they sit on. Sweeping a
+    // declaration in here would give it the `field` kind and the enclosing
+    // structure's qualified name — worse than the status quo of missing it.
+    if (HEADER_LINE.test(line) || COMMAND_LINE.test(line)) continue;
+    // Prose is not code. A docstring sentence that happens to contain a colon
+    // — "More precisely, it does so in a relative setting:" — otherwise mints
+    // a field for every word to its left.
+    if (commentLines[child.startPosition.row] === 1) continue;
+    if (line.slice(0, child.startPosition.column).includes('--')) continue;
+    emitOne(child);
+  }
+}
+
+/**
+ * Keywords and modifiers that can appear in identifier position after an ERROR
+ * but are never a name being declared.
+ */
+const LEAN_KEYWORDS: ReadonlySet<string> = new Set([
+  'protected', 'private', 'noncomputable', 'partial', 'unsafe', 'scoped', 'local',
+  'mutual', 'deriving', 'extends', 'where', 'with', 'from', 'this', 'at', 'in',
+  'fun', 'let', 'have', 'show', 'match', 'do', 'then', 'else', 'if', 'by',
+  'end', 'export', 'namespace', 'section', 'open', 'variable', 'universe',
+  'attribute', 'instance', 'macro', 'notation', 'syntax', 'infixl', 'infixr',
+  'prefix', 'postfix', 'set_option', 'include', 'omit', 'import',
+]);
+
+/** A top-level command whose line declares no structure field. */
+const COMMAND_LINE =
+  /^[ \t]*(variable|attribute|open|export|namespace|section|end|universe|set_option|include|omit|import|deriving|notation|macro|syntax|infixl|infixr|prefix|postfix|local|scoped)\b/;
+
+/** Is `node` the first non-whitespace token on its source line? */
+function isFirstTokenOnLine(node: SyntaxNode, source: string): boolean {
+  for (let i = node.startIndex - 1; i >= 0; i--) {
+    const ch = source[i];
+    if (ch === NEWLINE) return true;
+    if (ch !== ' ' && ch !== '\t' && ch !== CARRIAGE_RETURN) return false;
+  }
+  return true;
+}
+
+/**
+ * Does `node` sit to the left of a type ascription on its own line?
+ *
+ * The shape of a Lean structure field in both its forms — `a : T` and the
+ * multi-name `a b : T`. `:=` is rejected deliberately: a `where`-struct
+ * assignment binds a value to an already-declared field and introduces no
+ * new name.
+ */
+function precedesTypeAscription(node: SyntaxNode, source: string): boolean {
+  const line = sourceLineOf(node, source);
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== ':') continue;
+    if (line[i + 1] === '=') return false;
+    return node.startPosition.column < i;
+  }
+  return false;
+}
+
+/** The full text of the source line containing `node`. */
+function sourceLineOf(node: SyntaxNode, source: string): string {
+  let start = node.startIndex;
+  while (start > 0 && source[start - 1] !== NEWLINE) start--;
+  let end = node.startIndex;
+  while (end < source.length && source[end] !== NEWLINE) end++;
+  return source.slice(start, end);
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +1025,8 @@ function rescueFromErrorSpan(
   ctx: ExtractorContext,
   seenLines: Set<number>,
   commentLines: Uint8Array,
-  declLines: ReadonlyMap<number, string>
+  declLines: ReadonlyMap<number, string>,
+  sourceLines: readonly string[]
 ): void {
   const text = ctx.source.slice(err.startIndex, err.endIndex);
   const baseLine = err.startPosition.row;
@@ -922,6 +1077,13 @@ function rescueFromErrorSpan(
   // emitted as a citation from its signature line, and again at every use.
   const boundRows: Array<{ row: number; name: string }> = [];
   collectBoundNames(err, ctx.source, (name, row) => { boundRows.push({ row, name }); });
+
+  // The identifiers the parser DID keep, by row — the complement of what
+  // `emitFieldAssignRefs` has to read out of the raw text.
+  const coveredTokens = new Map<number, Set<string>>();
+  for (const [row, ids] of byLine) {
+    coveredTokens.set(row, new Set(ids.map(id => getNodeText(id, ctx.source).trim())));
+  }
 
   const endLine = err.endPosition.row;
   for (let i = 0; i < found.length; i++) {
@@ -975,6 +1137,17 @@ function rescueFromErrorSpan(
           });
         }
       }
+
+      // A rescued declaration can carry a perfectly ordinary `where`-struct
+      // whose rows the parser still dropped, and the loop above can only claim
+      // identifiers the parser kept. `ofBall` in one development sits inside a
+      // 108-row cascade and cites `valBall_isClosed`/`valBall_nonempty` in
+      // plain `field := value` syntax; both reported as uncited because this
+      // path had no text fallback of its own while the parsed path did.
+      emitFieldAssignRefs(
+        node.id, entry.line, Math.min(until - 1, sourceLines.length - 1),
+        coveredTokens, sourceLines, locals, ctx
+      );
     } finally {
       ctx.popScope();
     }
@@ -1096,6 +1269,7 @@ export const leanExtractor: LanguageExtractor = {
           ns: [], parsedLines: new Set(), sectionLocals: new Set(),
           pendingDoc: undefined, declLines: declaredNameByLine(ctx.source),
           sourceLines: splitSourceLines(ctx.source),
+          commentLines: blockCommentLineFlags(ctx.source),
         });
         return true;
       }
@@ -1109,6 +1283,7 @@ export const leanExtractor: LanguageExtractor = {
     const state: WalkState = {
       ns: [], parsedLines: new Set(), sectionLocals: new Set(),
       pendingDoc: undefined, declLines, sourceLines: splitSourceLines(ctx.source),
+      commentLines: blockCommentLineFlags(ctx.source),
     };
 
     const closeBlock = (): void => {
@@ -1217,11 +1392,12 @@ export const leanExtractor: LanguageExtractor = {
     // context is gone by now, which is why rescued names take the prefix that
     // was open at their own position — recorded when the span was queued.
     const seenLines = new Set(state.parsedLines);
-    const commentLines = pendingRescue.length > 0
-      ? blockCommentLineFlags(ctx.source)
-      : new Uint8Array(0);
+    // `state.commentLines` is computed once per file. This used to build a
+    // second copy lazily, from when the rescue was its only consumer.
     for (const { err, ns } of pendingRescue) {
-      rescueFromErrorSpan(err, ns, ctx, seenLines, commentLines, state.declLines);
+      rescueFromErrorSpan(
+        err, ns, ctx, seenLines, state.commentLines, state.declLines, state.sourceLines
+      );
     }
     return true;
   },

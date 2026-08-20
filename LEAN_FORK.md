@@ -126,7 +126,7 @@ Deliberately small, to keep upstream releases cheap to absorb:
  M src/types.ts                      +1    'lean' in the LANGUAGES union
  M src/extraction/grammars.ts        +6    wasm file, .lean extension, display name, vendored set
  M src/extraction/languages/index.ts +2    import + EXTRACTORS entry
- ?? src/extraction/languages/lean.ts        the extractor (~960 lines)
+ ?? src/extraction/languages/lean.ts        the extractor (~1,060 lines)
  ?? src/extraction/wasm/tree-sitter-lean.wasm
  ?? __tests__/lean-extraction.test.ts       precision contract for the dependency graph
 ```
@@ -145,7 +145,24 @@ git checkout lean-support && git rebase v<next>
 npm run build && npx vitest run
 ```
 
-Then re-index a Lean project and confirm declaration recovery is still ~98%.
+### Validate on more than one corpus
+
+Then re-index and confirm declaration recovery is still ~98% — on **mathlib4 and
+batteries as well as your own development**, comparing node counts before and
+after, and reading the *diff* rather than the totals.
+
+This is not ceremony. Extraction heuristics look right on the corpus they were
+written against and fail elsewhere, and the failure is silent because totals
+barely move. A rule for recovering a structure field swallowed by an ERROR
+passed on the development that reported the bug, then minted `end`, `export`,
+`namespace`, `apply` and `attribute` as structure fields on batteries and
+mathlib — visible only as `+4 nodes` unless you list which ones.
+
+The same applies to language assumptions. Lean 4 does **not** accept the
+grouped field form `alpha beta : Nat`; it reads `beta` as a binder of `alpha`
+and fails to infer its type. When a rule depends on what the language means,
+check it against `lake env lean` rather than intuition — Lean 3 habits and
+other-language habits both mislead here.
 
 ## Indexing scope
 
