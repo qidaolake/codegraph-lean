@@ -248,7 +248,8 @@ function emitRefs(
   fromNodeId: string,
   ctx: ExtractorContext,
   locals: ReadonlySet<string>,
-  declLines?: ReadonlyMap<number, string>
+  declLines?: ReadonlyMap<number, string>,
+  binderTypes?: ReadonlyMap<string, string>
 ): void {
   if (!subtree) return;
 
@@ -262,6 +263,45 @@ function emitRefs(
       if (name && !locals.has(name)) {
         const line = node.startPosition.row + 1;
         const column = node.startPosition.column;
+        // Generalized dot notation off a binder whose type is written down.
+        //
+        // `C.hT_loss_margin` is a real citation, but the head is a binder, so
+        // the general rule below drops it rather than resolve every `x.val`
+        // and `p.δ` onto whatever happens to share the tail's name. When the
+        // binder is declared `(C : p.StandardComplianceLocalCertificate)` the
+        // owner is right there in the signature, no elaboration required —
+        // emit `StandardComplianceLocalCertificate.hT_loss_margin` and let the
+        // resolver's suffix match land it on that structure's field.
+        //
+        // Qualifying is the whole point. Emitting the bare tail instead
+        // recovers the same declarations and takes cross-layer edges from 13
+        // to 158, because `F_mem` and friends exist in several structures;
+        // scoping the reference to the owner cannot make that mistake.
+        const dotAt = name.indexOf('.');
+        if (dotAt > 0 && binderTypes !== undefined) {
+          const owner = binderTypes.get(name.slice(0, dotAt));
+          if (owner !== undefined) {
+            let tail = name.slice(dotAt + 1);
+            const nextDot = tail.indexOf('.');
+            if (nextDot > 0) tail = tail.slice(0, nextDot);
+            // A one-character tail is fine: `solution.π` is a real field, and an
+            // owner-scoped reference cannot collide the way a bare `π` would.
+            // Requiring two characters silently dropped every such projection —
+            // 18 previously-resolving `solution.π` edges on mathlib alone, which
+            // is how the guard was caught. Only a numeric tail is excluded, being
+            // tuple projection (`z.1`) rather than a name.
+            if (tail.length >= 1 && !/^[0-9]+$/.test(tail) && !TACTIC_STOPWORDS.has(tail)) {
+              ctx.addUnresolvedReference({
+                fromNodeId,
+                referenceName: `${owner}.${tail}`,
+                referenceKind: 'calls',
+                line,
+                column,
+              });
+            }
+            return;
+          }
+        }
         // `_root_.Foo.bar` escapes the enclosing namespace and names the symbol
         // absolutely. The marker itself is a resolution directive, not a symbol
         // (emitting it produced 1,537 junk rows on mathlib), and the REFERENCE
@@ -314,24 +354,59 @@ function emitRefs(
   walk(subtree, false);
 }
 
-/** Collect binder names (binding occurrences) and emit refs from their TYPES. */
+/**
+ * Collect binder names (binding occurrences) and emit refs from their TYPES.
+ *
+ * Also records each binder's declared type head in `binderTypes`, which is what
+ * lets `emitRefs` resolve `C.hT_loss_margin` — see {@link typeHeadOf}.
+ */
 function processBinders(
   binderHost: SyntaxNode | null,
   fromNodeId: string | null,
   ctx: ExtractorContext,
-  locals: Set<string>
+  locals: Set<string>,
+  binderTypes?: Map<string, string>
 ): void {
   if (!binderHost) return;
   for (const binder of namedChildren(binderHost)) {
     if (!BINDER_TYPES.has(binder.type)) continue;
+    const typeNode = lastField(binder, 'type');
+    const owner = binderTypes ? typeHeadOf(typeNode, ctx.source) : null;
     // Binding occurrences: record as local, never emit.
     for (const nameNode of allFields(binder, 'name')) {
       const n = getNodeText(nameNode, ctx.source).trim();
-      if (n) locals.add(n);
+      if (!n) continue;
+      locals.add(n);
+      if (owner && binderTypes) binderTypes.set(n, owner);
     }
     // The TYPE is the dependency — `[Monoid α]`, `(h : IsUnit x)`.
     if (fromNodeId) emitRefs(lastField(binder, 'type'), fromNodeId, ctx, locals);
   }
+}
+
+/**
+ * The name of the structure a binder's type denotes, or null.
+ *
+ * `(C : p.StandardComplianceLocalCertificate)` → `StandardComplianceLocalCertificate`
+ * `(h : Semi F M)`                            → `Semi`
+ * `{α : Type*}` / `(n : ℕ)`                   → null (not a project structure)
+ *
+ * Only the head matters: arguments are irrelevant to which structure owns the
+ * field, and the leading segments are a namespace path that the resolver's
+ * suffix match handles.
+ */
+function typeHeadOf(typeNode: SyntaxNode | null, source: string): string | null {
+  let node = typeNode;
+  // `Semi F M` parses as nested `app`s; the leftmost `fn` is the head.
+  while (node && node.type === 'app') node = lastField(node, 'fn') ?? node.namedChild(0);
+  if (!node || node.type !== 'identifier') return null;
+  const text = getNodeText(node, source).trim();
+  if (!text) return null;
+  const head = text.slice(text.lastIndexOf('.') + 1);
+  // A structure name is PascalCase in Lean convention. Requiring it keeps type
+  // variables (`α`, `ι`) and abbreviations out, and costs nothing: a field can
+  // only be projected off a structure.
+  return /^[A-Z]/.test(head) ? head : null;
 }
 
 /**
@@ -430,6 +505,8 @@ interface WalkState {
   readonly parsedLines: Set<number>;
   /** Names bound by section-level `variable` commands, suppressed as references. */
   readonly sectionLocals: Set<string>;
+  /** Section-`variable` binder name -> the structure its type names. */
+  readonly sectionBinderTypes: Map<string, string>;
   /** Docstring seen immediately before the current declaration. */
   pendingDoc: string | undefined;
   /** Line -> name declared there, so a binding occurrence is never cited. */
@@ -661,7 +738,14 @@ function handleDeclaration(
     // Locals start from section `variable`s, then accumulate this declaration's
     // own binders. Everything in this set is suppressed as a reference.
     const locals = new Set(state.sectionLocals);
-    processBinders(lastField(decl, 'binders') ?? findChildByType(decl, 'binders'), node.id, ctx, locals);
+    // Binder name -> the structure its declared type names, so a projection
+    // `C.field` can be emitted scoped to that structure. Seeded from any
+    // section-level `variable` binders already in force.
+    const binderTypes = new Map(state.sectionBinderTypes);
+    processBinders(
+      lastField(decl, 'binders') ?? findChildByType(decl, 'binders'),
+      node.id, ctx, locals, binderTypes
+    );
     // Then every name the PROOF binds — `have`, `obtain`, `set`, `let`, `fun`.
     // Collected up front over the whole declaration rather than tracked as the
     // walk descends: a tactic hypothesis is bound for the rest of the proof, so
@@ -674,12 +758,12 @@ function handleDeclaration(
     const fieldOffsets = fieldChildOffsets(decl);
     for (const child of namedChildren(decl)) {
       if (child.type === 'app' && !fieldOffsets.has(child.startIndex)) {
-        emitRefs(child, node.id, ctx, locals, state.declLines);
+        emitRefs(child, node.id, ctx, locals, state.declLines, binderTypes);
       }
     }
 
     // The statement / return type. For a theorem this IS the content.
-    emitRefs(lastField(decl, 'type'), node.id, ctx, locals, state.declLines);
+    emitRefs(lastField(decl, 'type'), node.id, ctx, locals, state.declLines, binderTypes);
 
     // Members: structure fields and inductive constructors.
     for (const child of namedChildren(decl)) {
@@ -694,18 +778,18 @@ function handleDeclaration(
     //   `:= term` / `:= by tactics`  → the `body` field
     //   `where` struct instances     → `where_struct` children
     //   equation-style `| pat => e`  → `match_alt` children
-    emitRefs(bodyNode, node.id, ctx, locals, state.declLines);
+    emitRefs(bodyNode, node.id, ctx, locals, state.declLines, binderTypes);
     for (const child of namedChildren(decl)) {
       if (child.type === 'where_struct') {
         for (const sf of namedChildren(child)) {
-          if (sf.type === 'struct_field') emitRefs(lastField(sf, 'value'), node.id, ctx, locals, state.declLines);
+          if (sf.type === 'struct_field') emitRefs(lastField(sf, 'value'), node.id, ctx, locals, state.declLines, binderTypes);
         }
       } else if (child.type === 'match_alt') {
-        emitRefs(lastField(child, 'body') ?? child, node.id, ctx, locals, state.declLines);
+        emitRefs(lastField(child, 'body') ?? child, node.id, ctx, locals, state.declLines, binderTypes);
       } else if (child.type === 'where_aux_def' || child.type === 'ERROR') {
         // `where`-bound auxiliary definitions, and anything the grammar could
         // not structure — both still carry real citations.
-        emitRefs(child, node.id, ctx, locals, state.declLines);
+        emitRefs(child, node.id, ctx, locals, state.declLines, binderTypes);
       }
     }
 
@@ -1266,7 +1350,7 @@ export const leanExtractor: LanguageExtractor = {
       // here rather than let the generic path mint a mis-named node.
       if (DECL_KINDS.has(node.type)) {
         handleDeclaration(node, ctx, {
-          ns: [], parsedLines: new Set(), sectionLocals: new Set(),
+          ns: [], parsedLines: new Set(), sectionLocals: new Set(), sectionBinderTypes: new Map(),
           pendingDoc: undefined, declLines: declaredNameByLine(ctx.source),
           sourceLines: splitSourceLines(ctx.source),
           commentLines: blockCommentLineFlags(ctx.source),
@@ -1276,12 +1360,17 @@ export const leanExtractor: LanguageExtractor = {
       return false;
     }
 
-    interface Block { kind: 'namespace' | 'section'; pushedScope: boolean; savedLocals: Set<string> }
+    interface Block {
+      kind: 'namespace' | 'section';
+      pushedScope: boolean;
+      savedLocals: Set<string>;
+      savedBinderTypes: Map<string, string>;
+    }
     const blocks: Block[] = [];
     const pendingRescue: Array<{ err: SyntaxNode; ns: string[] }> = [];
     const declLines = declaredNameByLine(ctx.source);
     const state: WalkState = {
-      ns: [], parsedLines: new Set(), sectionLocals: new Set(),
+      ns: [], parsedLines: new Set(), sectionLocals: new Set(), sectionBinderTypes: new Map(),
       pendingDoc: undefined, declLines, sourceLines: splitSourceLines(ctx.source),
       commentLines: blockCommentLineFlags(ctx.source),
     };
@@ -1293,6 +1382,8 @@ export const leanExtractor: LanguageExtractor = {
       if (block.pushedScope) ctx.popScope();
       state.sectionLocals.clear();
       for (const n of block.savedLocals) state.sectionLocals.add(n);
+      state.sectionBinderTypes.clear();
+      for (const [k, v] of block.savedBinderTypes) state.sectionBinderTypes.set(k, v);
     };
 
     for (const child of namedChildren(node)) {
@@ -1307,18 +1398,29 @@ export const leanExtractor: LanguageExtractor = {
           const nameNode = lastField(child, 'name');
           const nsName = nameNode ? getNodeText(nameNode, ctx.source).trim() : '';
           const saved = new Set(state.sectionLocals);
-          if (!nsName) { blocks.push({ kind: 'namespace', pushedScope: false, savedLocals: saved }); break; }
+          const savedTypes = new Map(state.sectionBinderTypes);
+          if (!nsName) {
+            blocks.push({ kind: 'namespace', pushedScope: false, savedLocals: saved, savedBinderTypes: savedTypes });
+            break;
+          }
           const qualifiedName = [...state.ns, nsName].join('.');
           const nsNode = ctx.createNode('namespace', nsName, child, { qualifiedName });
           state.ns.push(nsName);
           if (nsNode) ctx.pushScope(nsNode.id);
-          blocks.push({ kind: 'namespace', pushedScope: Boolean(nsNode), savedLocals: saved });
+          blocks.push({
+            kind: 'namespace', pushedScope: Boolean(nsNode),
+            savedLocals: saved, savedBinderTypes: savedTypes,
+          });
           break;
         }
 
         case 'section': {
           // A section scopes `variable`s but never qualifies a name.
-          blocks.push({ kind: 'section', pushedScope: false, savedLocals: new Set(state.sectionLocals) });
+          blocks.push({
+            kind: 'section', pushedScope: false,
+            savedLocals: new Set(state.sectionLocals),
+            savedBinderTypes: new Map(state.sectionBinderTypes),
+          });
           break;
         }
 
@@ -1333,7 +1435,7 @@ export const leanExtractor: LanguageExtractor = {
           // TYPES once against the enclosing scope rather than re-attributing
           // them to every following declaration (which would over-connect).
           const owner = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : null;
-          processBinders(child, owner ?? null, ctx, state.sectionLocals);
+          processBinders(child, owner ?? null, ctx, state.sectionLocals, state.sectionBinderTypes);
           break;
         }
 

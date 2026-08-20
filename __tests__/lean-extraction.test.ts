@@ -388,6 +388,81 @@ describe('Lean 4 extraction', () => {
     }
   });
 
+  it('resolves a projection off a binder whose type is written down', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-proj-'));
+
+    // `C.hT_loss_margin` is a real citation, but the head is a binder, so the
+    // general rule drops it rather than resolve every `x.val` onto whatever
+    // shares the tail's name. When the binder is DECLARED `(C : Cert)` the
+    // owner is in the signature already — no elaboration needed.
+    //
+    // The decisive part is that the emitted reference is OWNER-SCOPED. Two
+    // structures here declare a field called `margin`; a bare-tail reference
+    // would pick one arbitrarily, which on a real corpus took spurious
+    // cross-layer edges from 13 to 158.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Certs.lean'),
+      'structure Cert where\n' +
+        '  margin : Nat\n' +
+        '  hT_loss_margin : Nat\n' +
+        '\n' +
+        'structure Decoy where\n' +
+        '  margin : Nat\n'
+    );
+
+    fs.writeFileSync(
+      path.join(tmpDir, 'Uses.lean'),
+      'theorem reader (C : Cert) : Nat :=\n' +
+        '  C.hT_loss_margin + C.margin\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const reader = cg.getNodesByKind('function').find((n) => n.name === 'reader');
+    expect(reader).toBeDefined();
+
+    const cited = cg
+      .getOutgoingEdges(reader!.id)
+      .filter((e) => CITES.has(e.kind))
+      .map((e) => cg.getNode(e.target))
+      .filter((n): n is NonNullable<typeof n> => !!n);
+
+    expect(cited.map((n) => n.name)).toContain('hT_loss_margin');
+
+    // `C.margin` must land on Cert.margin, never Decoy.margin.
+    const margin = cited.find((n) => n.name === 'margin');
+    expect(margin).toBeDefined();
+    expect(margin!.qualifiedName).toContain('Cert');
+    expect(margin!.qualifiedName).not.toContain('Decoy');
+
+    // A field of the decoy that nothing projects stays uncited.
+    const decoyMargin = cg
+      .getNodesByKind('field')
+      .find((n) => n.qualifiedName?.includes('Decoy'));
+    expect(decoyMargin).toBeDefined();
+    expect(citationsTo(cg, decoyMargin!.id)).toBe(0);
+  });
+
+  it('does not invent a projection when the binder type is unknown', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-proj-neg-'));
+
+    // The guard. Only a binder with a written-down structure type earns the
+    // rewrite; a type variable does not, or the pass degenerates into the
+    // bare-tail matching it exists to avoid.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Neg.lean'),
+      'structure Decoy where\n' +
+        '  hidden_field : Nat\n' +
+        '\n' +
+        'theorem opaqueReader {α : Type} (x : α) : Nat :=\n' +
+        '  x.hidden_field\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const reader = cg.getNodesByKind('function').find((n) => n.name === 'opaqueReader');
+    expect(reader).toBeDefined();
+    expect(citedNames(cg, reader!.id)).not.toContain('hidden_field');
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

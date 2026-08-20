@@ -126,7 +126,7 @@ Deliberately small, to keep upstream releases cheap to absorb:
  M src/types.ts                      +1    'lean' in the LANGUAGES union
  M src/extraction/grammars.ts        +6    wasm file, .lean extension, display name, vendored set
  M src/extraction/languages/index.ts +2    import + EXTRACTORS entry
- ?? src/extraction/languages/lean.ts        the extractor (~1,060 lines)
+ ?? src/extraction/languages/lean.ts        the extractor (~1,130 lines)
  ?? src/extraction/wasm/tree-sitter-lean.wasm
  ?? __tests__/lean-extraction.test.ts       precision contract for the dependency graph
 ```
@@ -204,16 +204,29 @@ Expect `ABI version: 15` and `RESULT: PASS`.
 ## Known limits
 
 The extractor records **cited** dependencies — what the source text names. It does not attempt
-typeclass instance resolution, simp-set closure under bare `simp`, coercion insertion,
-macro-generated declarations, or generalized dot notation (`b.foo` needs the type of `b`). Those are
-decided during elaboration and leave no token behind; for them, Lean's own tooling (`.ilean` files,
-or `getUsedConstants` over a built environment) is the answer.
+typeclass instance resolution, simp-set closure under bare `simp`, coercion insertion, or
+macro-generated declarations. Those are decided during elaboration and leave no token behind; for
+them, Lean's own tooling (`.ilean` files, or `getUsedConstants` over a built environment) is the
+answer.
 
-Dot notation is the limit that bites hardest in practice, because it is how a certificate's fields
-are consumed. `h_stage_sender_on := E.h_stage_sender` is a real citation, but the head `E` is a
-one-character binder, so the reference is dropped rather than risk resolving every `x.val` and `p.δ`
-projection onto a same-named declaration. Consequence: **a lemma consumed only through dot notation
-reports as uncited.** Treat a zero-inbound result as "no *textual* citation", and grep the bare name
+`@[simp]` deserves singling out: an attribute-registered lemma is consumed by `simp` calls that
+never name it, so it is cited constantly and textually invisible. No source-level extractor will
+ever reclassify these. Check the `decorators` column before believing a zero-inbound result.
+
+Dot notation is **partly** covered. When the projection's head is a binder whose type is written
+down in the signature — `(C : p.StandardComplianceLocalCertificate)`, `variable (solution :
+relations.Solution M)` — the owning structure is recoverable from the source alone, and `C.field` is
+emitted as `StandardComplianceLocalCertificate.field`, which the resolver matches against that
+structure's qualified name.
+
+Scoping to the owner is the whole point, not an implementation detail. Emitting the bare tail
+instead recovers a similar number of declarations and takes spurious cross-layer edges from 13 to
+158, because field names like `F_mem` and `hFsc` exist in several structures at once.
+
+What remains uncovered is a projection whose head has no written-down type: `fun x => x.val`, a
+`have`-bound term, or a head whose type is a variable. For those the answer is still elaboration.
+So **a lemma consumed only through an untyped projection still reports as uncited** — treat a
+zero-inbound result as "no *textual* citation the extractor can attribute", and grep `\.name\b`
 before concluding anything is dead.
 
 Resolution is also **name-based, not import-scoped**: a reference resolves to a same-named node
