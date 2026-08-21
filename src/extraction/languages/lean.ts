@@ -515,6 +515,8 @@ interface WalkState {
   readonly sourceLines: readonly string[];
   /** Per-row flag: is this line inside a `/- -/` block? Prose is not code. */
   readonly commentLines: Uint8Array;
+  /** Row -> the namespace prefix open there, read from the text. */
+  readonly nsByLine: readonly (readonly string[])[];
 }
 
 /**
@@ -715,9 +717,24 @@ function handleDeclaration(
 
   const rawName = declName(decl, ctx);
   if (!rawName) return;
+  // One node per declaration START ROW. A declaration can be reached twice —
+  // once through the ordinary walk and once through `declarationsWithin` on an
+  // ERROR that encloses it — and without this guard each visit created its own
+  // node. The two were previously distinguishable because one carried the
+  // namespace and the other did not, so nothing collided and the duplication
+  // went unnoticed; once both qualified correctly they became the SAME
+  // qualified name, and an ambiguous qualified name resolves to nothing.
+  // Measured at 1,731 usages on a 148-file development whose enclosing
+  // declaration could not be identified for exactly this reason.
+  if (state.parsedLines.has(decl.startPosition.row)) return;
   state.parsedLines.add(decl.startPosition.row);
 
-  const { name, qualifiedName } = qualify(state.ns, rawName);
+  // The namespace open at this declaration's own line, taken from the text
+  // rather than the walk's stack. The two agree whenever the walk saw the
+  // `namespace` command — but a `namespace` swallowed by an ERROR is never
+  // pushed, and then every declaration that ERROR buries is qualified with
+  // nothing at all. One 16,190-line file lost the prefix on 159 declarations.
+  const { name, qualifiedName } = qualify(state.nsByLine[decl.startPosition.row] ?? state.ns, rawName);
 
   // The signature is the header text up to the body separator — for a theorem
   // that is the whole mathematical content.
@@ -1021,6 +1038,11 @@ const RESCUE_KINDS: ReadonlyMap<string, NodeKind> = new Map<string, NodeKind>([
   ['inductive', 'enum'], ['example', 'function'],
 ]);
 
+/** Node kinds the rescue can create, and therefore can duplicate. */
+const RESCUE_NODE_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>([
+  'function', 'struct', 'enum',
+]);
+
 /** Declaration keywords that are legitimately anonymous (`instance : C X where`). */
 const RESCUE_ANONYMOUS: ReadonlySet<string> = new Set(['instance', 'example']);
 
@@ -1118,8 +1140,11 @@ function namespaceByLine(source: string, commentLines: Uint8Array): string[][] {
   return out;
 }
 
+// `mutual` contributes no name but DOES close with `end`. Omitting it made that
+// `end` pop the enclosing namespace, so every declaration after a mutual block
+// lost its prefix.
 const OPEN_SCOPE_LINE =
-  /^[ \t]*(namespace|section)[ \t]*([A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*)?/;
+  /^[ \t]*(namespace|section|mutual)[ \t]*([A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*)?/;
 const END_SCOPE_LINE = /^[ \t]*end\b/;
 
 function declaredNameByLine(source: string): Map<number, string> {
@@ -1410,11 +1435,13 @@ export const leanExtractor: LanguageExtractor = {
       // Defensive: if the core ever dispatches a Lean declaration itself, own it
       // here rather than let the generic path mint a mis-named node.
       if (DECL_KINDS.has(node.type)) {
+        const bareComments = blockCommentLineFlags(ctx.source);
         handleDeclaration(node, ctx, {
           ns: [], parsedLines: new Set(), sectionLocals: new Set(), sectionBinderTypes: new Map(),
           pendingDoc: undefined, declLines: declaredNameByLine(ctx.source),
           sourceLines: splitSourceLines(ctx.source),
-          commentLines: blockCommentLineFlags(ctx.source),
+          commentLines: bareComments,
+          nsByLine: namespaceByLine(ctx.source, bareComments),
         });
         return true;
       }
@@ -1435,10 +1462,11 @@ export const leanExtractor: LanguageExtractor = {
     // before every namespace there is.
     const pendingRescue: SyntaxNode[] = [];
     const declLines = declaredNameByLine(ctx.source);
+    const commentLines = blockCommentLineFlags(ctx.source);
     const state: WalkState = {
       ns: [], parsedLines: new Set(), sectionLocals: new Set(), sectionBinderTypes: new Map(),
       pendingDoc: undefined, declLines, sourceLines: splitSourceLines(ctx.source),
-      commentLines: blockCommentLineFlags(ctx.source),
+      commentLines, nsByLine: namespaceByLine(ctx.source, commentLines),
     };
 
     const closeBlock = (): void => {
@@ -1557,15 +1585,27 @@ export const leanExtractor: LanguageExtractor = {
 
     // Rescue runs last: `parsedLines` must be complete first, so a declaration
     // the grammar handled is never duplicated by the text scan.
+    // Rows that already carry a declaration node, from ANY path — not just
+    // `parsedLines`, which only records what THIS walk parsed. The core also
+    // dispatches Lean declarations straight to `visitNode`, and those calls
+    // carry their own throwaway state, so the rescue could not see them and
+    // minted a second node for the same declaration. Harmless-looking while
+    // the two disagreed on the namespace; once both qualified correctly they
+    // became one ambiguous qualified name that resolves to nothing — 1,731
+    // usages on a 148-file development.
     const seenLines = new Set(state.parsedLines);
+    for (const existing of ctx.nodes) {
+      if (RESCUE_NODE_KINDS.has(existing.kind) && existing.startLine !== undefined) {
+        seenLines.add(existing.startLine - 1);
+      }
+    }
     // `state.commentLines` is computed once per file. This used to build a
     // second copy lazily, from when the rescue was its only consumer.
-    const nsByLine = namespaceByLine(ctx.source, state.commentLines);
     for (const err of pendingRescue) {
       rescueFromErrorSpan(
-        err, nsByLine, ctx, seenLines, state.commentLines, state.declLines, state.sourceLines
+        err, state.nsByLine, ctx, seenLines, state.commentLines, state.declLines, state.sourceLines
       );
-    }
+      }
     return true;
   },
 };

@@ -560,6 +560,40 @@ describe('Lean 4 extraction', () => {
     expect(outer!.qualifiedName).toBe('Demo.recoveredOuter');
   });
 
+  it('does not let a mutual block close the enclosing namespace', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-mutual-'));
+
+    // The namespace prefix is read from the text, by tracking which scopes are
+    // open. `mutual` contributes no name but DOES close with `end`, so leaving
+    // it out of the scope tracker made that `end` pop the enclosing namespace
+    // and every later declaration lose its prefix.
+    //
+    // Unlike the other rescue tests this one is genuinely reproducible, because
+    // a mutual block is ordinary Lean rather than a parser failure.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Mutual.lean'),
+      'namespace Demo\n' +
+        '\n' +
+        'mutual\n' +
+        '  def isEven : Nat → Bool\n' +
+        '    | 0 => true\n' +
+        '    | n + 1 => isOdd n\n' +
+        '  def isOdd : Nat → Bool\n' +
+        '    | 0 => false\n' +
+        '    | n + 1 => isEven n\n' +
+        'end\n' +
+        '\n' +
+        'theorem afterMutual : True := trivial\n' +
+        '\n' +
+        'end Demo\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const after = cg.getNodesByKind('function').find((n) => n.name === 'afterMutual');
+    expect(after).toBeDefined();
+    expect(after!.qualifiedName).toBe('Demo.afterMutual');
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

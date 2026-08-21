@@ -114,8 +114,18 @@ const db = new DatabaseSync(dbPath);
 // ---------------------------------------------------------------------------
 const byQualified = new Map();
 const byShort = new Map();
+// Only kinds a citation can actually target. Including `namespace` / `import` /
+// `file` rows made a declaration look AMBIGUOUS whenever its qualified name
+// matched a namespace node of the same name — `Sanctions.Foundations.Foo` as
+// both a namespace and a structure — and `resolveName` declines ambiguity, so
+// those citations were silently dropped. Invisible until the namespace fix made
+// qualified names correct enough to start colliding.
+const TARGET_KINDS = "('function','struct','enum','class','field','method','constant')";
+
 const nodeFile = new Map();
-for (const row of db.prepare('SELECT id, name, qualified_name, file_path FROM nodes').all()) {
+for (const row of db
+  .prepare(`SELECT id, name, qualified_name, file_path FROM nodes WHERE kind IN ${TARGET_KINDS}`)
+  .all()) {
   if (row.qualified_name) {
     const bucket = byQualified.get(row.qualified_name);
     if (bucket) bucket.push(row.id);
@@ -281,7 +291,7 @@ for (const r of db.prepare('SELECT DISTINCT file_path FROM nodes').all()) {
 /** name -> [{id, module}] for every node that could be a citation target. */
 const candidatesByName = new Map();
 for (const r of db
-  .prepare("SELECT id, name, file_path FROM nodes WHERE kind IN ('function','struct','enum','class','field')")
+  .prepare(`SELECT id, name, file_path FROM nodes WHERE kind IN ${TARGET_KINDS}`)
   .all()) {
   const bucket = candidatesByName.get(r.name);
   const entry = { id: r.id, module: pathToModule.get(fwd(r.file_path)) };
