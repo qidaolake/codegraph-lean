@@ -199,9 +199,21 @@ you are changing**, and for a "is anything still reading this?" question that er
 dangerous way — a missing consumer always reads as *safe to move*.
 
 `sync` preserves `provenance='ilean'` edges except for the files it re-indexed, whose edges it
-correctly drops as stale. The `.ilean` files themselves only refresh on `lake build`, so the honest
-order during a refactor is: edit → `sync` (fast, or automatic) → `lake build` → re-run the enrich
-script.
+correctly drops as stale. It does **not** preserve the pruning: pruning deletes source-resolved
+edges, and `sync` re-extracts exactly those from source. One edited file was enough to take a pruned
+pair from 0 back to 65.
+
+So re-run the enrichment after `sync` as well as after `index`. It costs about 2 s on a 259-file
+project and is idempotent — a second run with nothing changed deletes 0 and re-points 0. The honest
+order during a refactor is: edit → `sync` → `lake build` → re-run the enrich script.
+
+Doing better would mean applying the import-closure constraint when the edge is **created** rather
+than deleting it afterwards. That belongs in codegraph's resolver, and it is not a small change
+there: `getNodesByName` is cached globally by name with no requesting-module parameter, so scoping
+candidates by reachability means threading module context through `src/resolution/index.ts` and
+`src/resolution/name-matcher.ts` — two high-churn upstream files this fork otherwise never touches,
+on a hot path with its own caches. Left undone on purpose; the delta is worth more than the
+convenience.
 
 ## Optional: enrich the index from `.ilean` (the elaborated reference graph)
 

@@ -42,8 +42,20 @@
 //     original they replaced is already gone, so removing them would just lose
 //     the correction. A full re-index restores the originals and the next run
 //     corrects them again.
-//   - Re-indexing (`codegraph index`, or the file watcher) rebuilds the edge
-//     table and DROPS these. Re-run afterwards.
+//   - `codegraph index` rebuilds the edge table and drops the added edges.
+//   - `codegraph sync` does NOT drop them outside the files it re-indexed — but
+//     it DOES undo the pruning, because pruning deletes SOURCE-resolved edges
+//     and sync re-extracts exactly those from source. Measured: a pruned pair
+//     went 0 -> 65 after editing one unrelated file and syncing.
+//
+//     So the rule is simply "re-run after sync too", which costs ~2s and is
+//     idempotent. Doing better means applying the import-closure constraint
+//     when the edge is CREATED rather than deleting it afterwards, and that
+//     lives in codegraph's resolver: `getNodesByName` is cached globally by
+//     name with no requesting-module parameter, so scoping it means threading
+//     module reachability through `src/resolution/index.ts` and
+//     `name-matcher.ts` — both high-churn upstream files this fork otherwise
+//     does not touch. Deliberately not done; see LEAN_FORK.md.
 //
 //   - It also PRUNES impossible edges (see below). `--no-prune` disables that.
 //
@@ -117,6 +129,18 @@ for (const row of db.prepare('SELECT id, name, qualified_name, file_path FROM no
 }
 
 /**
+ * Strip Lean's `private` name mangling.
+ *
+ * A `private theorem foo` in module `A.B` is stored by the elaborator as
+ * `_private.A.B.0.A.B.foo`, and `.ilean` reports that mangled form. The
+ * extractor sees the source and records `A.B.foo`, which is correct — so
+ * without this the two never meet. Measured at 361 declarations on a 148-file
+ * development, all of them resolvable once the prefix comes off.
+ */
+const PRIVATE_PREFIX = /^_private\..+?\.\d+\./;
+const unmanglePrivate = (n) => n.replace(PRIVATE_PREFIX, '');
+
+/**
  * A Lean name resolves when the index holds exactly one node for it.
  *
  * Exact qualified name first (93.5% of declarations on the measured corpus).
@@ -124,7 +148,8 @@ for (const row of db.prepare('SELECT id, name, qualified_name, file_path FROM no
  * `.ilean` is that its names are unambiguous, so guessing between candidates
  * would throw that away and reintroduce the collisions it fixes.
  */
-function resolveName(fqn) {
+function resolveName(rawFqn) {
+  const fqn = unmanglePrivate(rawFqn);
   const exact = byQualified.get(fqn);
   if (exact && exact.length === 1) return exact[0];
   if (exact && exact.length > 1) return null;

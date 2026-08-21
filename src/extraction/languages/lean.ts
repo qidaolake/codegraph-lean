@@ -1074,6 +1074,54 @@ function blockCommentLineFlags(source: string): Uint8Array {
  * Serves two purposes: suppressing those harvests, and bounding how far a
  * rescued declaration may claim identifiers (it stops at the next header).
  */
+/**
+ * Row -> the dotted namespace prefix open at that row, read from the text.
+ *
+ * The rescue needs this because it runs over SPANS, not over the walk. A span
+ * is queued with the namespace in force where it started, which is right while
+ * the span sits inside one namespace and wrong the moment it crosses a
+ * `namespace` or an `end`. The worst case is a file that fails to parse
+ * entirely: the root span is queued with NO namespace, so every declaration
+ * recovered from it gets a bare qualified name — `bdStationary_eq_excess`
+ * instead of `Sanctions.Foundations.bdStationary_eq_excess`.
+ *
+ * Not cosmetic. A bare qualified name cannot be matched BY qualified name, so
+ * those declarations fall through to short-name matching — precisely the
+ * collision that produces wrong cross-module edges. Measured on a 148-file
+ * development: 446 declarations, 5.6% of the project.
+ *
+ * `section` contributes no name but must still be pushed, or its `end` would
+ * close the enclosing namespace instead.
+ */
+function namespaceByLine(source: string, commentLines: Uint8Array): string[][] {
+  const lines = source.split(NEWLINE);
+  const out: string[][] = new Array(lines.length);
+  const stack: string[] = [];
+  let current: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    out[i] = current;
+    if (commentLines[i] === 1) continue;
+    const line = lines[i] as string;
+    const open = OPEN_SCOPE_LINE.exec(line);
+    if (open) {
+      stack.push(open[1] === 'namespace' && open[2] ? open[2] : '');
+      current = stack.filter((s) => s !== '');
+      out[i] = current;
+      continue;
+    }
+    if (END_SCOPE_LINE.test(line)) {
+      stack.pop();
+      current = stack.filter((s) => s !== '');
+      out[i] = current;
+    }
+  }
+  return out;
+}
+
+const OPEN_SCOPE_LINE =
+  /^[ \t]*(namespace|section)[ \t]*([A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*)?/;
+const END_SCOPE_LINE = /^[ \t]*end\b/;
+
 function declaredNameByLine(source: string): Map<number, string> {
   const out = new Map<number, string>();
   const lines = source.split(NEWLINE);
@@ -1105,7 +1153,7 @@ function errorSpans(root: SyntaxNode): SyntaxNode[] {
  */
 function rescueFromErrorSpan(
   err: SyntaxNode,
-  ns: readonly string[],
+  nsByLine: readonly (readonly string[])[],
   ctx: ExtractorContext,
   seenLines: Set<number>,
   commentLines: Uint8Array,
@@ -1183,7 +1231,10 @@ function rescueFromErrorSpan(
   for (let i = 0; i < found.length; i++) {
     const entry = found[i]!;
     const until = i + 1 < found.length ? found[i + 1]!.line : endLine + 1;
-    const { name, qualifiedName } = qualify(ns, entry.name);
+    // The namespace open at THIS declaration's own line, not at the span's
+    // start — a span can cross a `namespace`/`end`, and a root-level span
+    // starts before every namespace in the file.
+    const { name, qualifiedName } = qualify(nsByLine[entry.line] ?? [], entry.name);
     // Anchor on the ERROR node and override the line range explicitly, rather
     // than requiring a real node on the header's line. A CATASTROPHIC span emits
     // almost no named nodes at all — one FLT file parses as a single 880-line
@@ -1377,7 +1428,12 @@ export const leanExtractor: LanguageExtractor = {
       savedBinderTypes: Map<string, string>;
     }
     const blocks: Block[] = [];
-    const pendingRescue: Array<{ err: SyntaxNode; ns: string[] }> = [];
+    // Spans to read back from the text once the walk is done. No namespace is
+    // captured here: `namespaceByLine` gives each recovered declaration the
+    // prefix at its OWN line, which is the only thing that is right for a span
+    // crossing a `namespace`/`end` — or for a whole-file span, which starts
+    // before every namespace there is.
+    const pendingRescue: SyntaxNode[] = [];
     const declLines = declaredNameByLine(ctx.source);
     const state: WalkState = {
       ns: [], parsedLines: new Set(), sectionLocals: new Set(), sectionBinderTypes: new Map(),
@@ -1467,7 +1523,7 @@ export const leanExtractor: LanguageExtractor = {
           // A derailed parse can bury later declarations ARBITRARILY deep inside
           // this one — not as declaration nodes, but as loose identifiers. Read
           // them back out of the source text.
-          for (const e of errorSpans(child)) pendingRescue.push({ err: e, ns: [...state.ns] });
+          for (const e of errorSpans(child)) pendingRescue.push(e);
           break;
         }
 
@@ -1476,7 +1532,7 @@ export const leanExtractor: LanguageExtractor = {
             // A declaration not wrapped in `declaration` (some forms are bare).
             handleDeclaration(child, ctx, state);
           } else if (child.type === 'ERROR') {
-            pendingRescue.push({ err: child, ns: [...state.ns] });
+            pendingRescue.push(child);
             // A command the grammar cannot parse (`alias`, `notation3`, `elab`)
             // swallows everything up to the next thing it recognises, and real
             // declarations get caught inside. Driving the walk from `module`
@@ -1497,18 +1553,17 @@ export const leanExtractor: LanguageExtractor = {
     while (blocks.length > 0) closeBlock();
 
     // A root that failed to parse holds declarations no walk can see.
-    if (node.type !== 'module') pendingRescue.push({ err: node, ns: [] });
+    if (node.type !== 'module') pendingRescue.push(node);
 
     // Rescue runs last: `parsedLines` must be complete first, so a declaration
-    // the grammar handled is never duplicated by the text scan. Namespace
-    // context is gone by now, which is why rescued names take the prefix that
-    // was open at their own position — recorded when the span was queued.
+    // the grammar handled is never duplicated by the text scan.
     const seenLines = new Set(state.parsedLines);
     // `state.commentLines` is computed once per file. This used to build a
     // second copy lazily, from when the rescue was its only consumer.
-    for (const { err, ns } of pendingRescue) {
+    const nsByLine = namespaceByLine(ctx.source, state.commentLines);
+    for (const err of pendingRescue) {
       rescueFromErrorSpan(
-        err, ns, ctx, seenLines, state.commentLines, state.declLines, state.sourceLines
+        err, nsByLine, ctx, seenLines, state.commentLines, state.declLines, state.sourceLines
       );
     }
     return true;

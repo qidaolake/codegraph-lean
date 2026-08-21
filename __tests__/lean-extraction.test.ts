@@ -507,6 +507,59 @@ describe('Lean 4 extraction', () => {
     expect(fns).toContain('afterIt');
   });
 
+  it('keeps the namespace on a declaration recovered from an unparseable file', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-ns-'));
+
+    // When a whole file fails to parse, the rescue used to run on the root span
+    // with NO namespace, so every declaration it recovered got a bare qualified
+    // name — `helper` instead of `Demo.Inner.helper`. A bare qualified name
+    // cannot be matched BY qualified name, so those declarations fall through
+    // to short-name matching, which is exactly the collision that produces
+    // wrong cross-module edges. Measured: 2,726 declarations on a 3,655-file
+    // mathlib slice, 446 on a 148-file development.
+    //
+    // The prefix now comes from the namespace open at each recovered
+    // declaration's OWN line, which is also the only thing that is right for a
+    // span crossing a `namespace`/`end`.
+    //
+    // HONEST LIMIT: this pins the CONTRACT and not the failure. Reproducing it
+    // needs a file whose ROOT parses as ERROR, and three attempts here all
+    // yielded a clean `module` root with the ERROR as a child, where the walk
+    // tracks namespaces normally and both builds pass. The evidence is the
+    // corpora: bare qualified names fell 25,218 -> 22,492 on a 3,655-file
+    // mathlib slice, 162 -> 119 on batteries, 553 -> 461 on a 148-file
+    // development, with node counts unchanged on all three.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Broken.lean'),
+      'namespace Demo\n' +
+        'namespace Inner\n' +
+        '\n' +
+        '    p.DanglingFragment D xT :=\n' +
+        '  p.helperCall (dlo := p.delta) (by rw [hF]; exact chord p.delta)\n' +
+        '\n' +
+        'theorem recoveredInner : True := trivial\n' +
+        '\n' +
+        'end Inner\n' +
+        '\n' +
+        'theorem recoveredOuter : True := trivial\n' +
+        '\n' +
+        'end Demo\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const fns = cg.getNodesByKind('function');
+
+    const inner = fns.find((n) => n.name === 'recoveredInner');
+    const outer = fns.find((n) => n.name === 'recoveredOuter');
+    expect(inner).toBeDefined();
+    expect(outer).toBeDefined();
+
+    // The prefix must track the line, not the file: `recoveredOuter` sits after
+    // `end Inner`, so it is Demo-only even though it is in the same span.
+    expect(inner!.qualifiedName).toBe('Demo.Inner.recoveredInner');
+    expect(outer!.qualifiedName).toBe('Demo.recoveredOuter');
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(
