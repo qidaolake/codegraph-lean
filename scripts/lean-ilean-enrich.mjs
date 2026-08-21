@@ -36,12 +36,18 @@
 // CAVEATS
 // -------
 //   - Requires a SUCCESSFUL `lake build`. A stale build means stale edges.
-//   - Edges are tagged `provenance = 'ilean'` and this script deletes its own
-//     previous output first, so re-running is idempotent.
+//   - Added edges are tagged `provenance = 'ilean'` and this script deletes its
+//     own previous output first, so re-running is idempotent. Corrected edges
+//     are tagged `'ilean-repoint'` and are NOT deleted on re-run: the wrong
+//     original they replaced is already gone, so removing them would just lose
+//     the correction. A full re-index restores the originals and the next run
+//     corrects them again.
 //   - Re-indexing (`codegraph index`, or the file watcher) rebuilds the edge
 //     table and DROPS these. Re-run afterwards.
 //
-// Usage: node scripts/lean-ilean-enrich.mjs [projectRoot] [--dry-run]
+//   - It also PRUNES impossible edges (see below). `--no-prune` disables that.
+//
+// Usage: node scripts/lean-ilean-enrich.mjs [projectRoot] [--dry-run] [--no-prune]
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -49,6 +55,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const argv = process.argv.slice(2);
 const dryRun = argv.includes('--dry-run');
+const noPrune = argv.includes('--no-prune');
 const root = resolve(argv.find((a) => !a.startsWith('--')) ?? process.cwd());
 
 const dbPath = join(root, '.codegraph', 'codegraph.db');
@@ -95,7 +102,8 @@ const db = new DatabaseSync(dbPath);
 // ---------------------------------------------------------------------------
 const byQualified = new Map();
 const byShort = new Map();
-for (const row of db.prepare('SELECT id, name, qualified_name FROM nodes').all()) {
+const nodeFile = new Map();
+for (const row of db.prepare('SELECT id, name, qualified_name, file_path FROM nodes').all()) {
   if (row.qualified_name) {
     const bucket = byQualified.get(row.qualified_name);
     if (bucket) bucket.push(row.id);
@@ -105,6 +113,7 @@ for (const row of db.prepare('SELECT id, name, qualified_name FROM nodes').all()
   const sb = byShort.get(short);
   if (sb) sb.push(row.id);
   else byShort.set(short, [row.id]);
+  nodeFile.set(row.id, String(row.file_path));
 }
 
 /**
@@ -126,6 +135,9 @@ function resolveName(fqn) {
 // ---------------------------------------------------------------------------
 // Walk the reference graph
 // ---------------------------------------------------------------------------
+/** module -> its direct imports, straight from `.ilean`. The real module graph. */
+const directImports = new Map();
+
 let usages = 0;
 let selfRefs = 0;
 let unresolvedTarget = 0;
@@ -139,6 +151,12 @@ for (const file of ileans) {
   } catch {
     console.error(`[ilean] skipping unreadable ${file}`);
     continue;
+  }
+  if (typeof doc.module === 'string') {
+    directImports.set(
+      doc.module,
+      (doc.directImports ?? []).map((i) => (Array.isArray(i) ? i[0] : i)).filter((x) => typeof x === 'string')
+    );
   }
   for (const [key, entry] of Object.entries(doc.references ?? {})) {
     if (!key.startsWith('{')) continue;
@@ -165,6 +183,138 @@ for (const file of ileans) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Prune: an edge into a module the source module cannot reach is impossible
+// ---------------------------------------------------------------------------
+//
+// `directImports` is the real module graph, and Lean has no cycles in it. If
+// module B is not in module A's transitive import closure, then nothing in A
+// can name anything in B — not through elaboration, not through a macro, not at
+// all. Any such edge is a resolver artifact.
+//
+// This is what closes name-based resolution: a reference resolves to a
+// same-named node anywhere in the project, so `F_mem` declared in five
+// structures lands wherever the index looked first. Those wrong edges are worst
+// exactly where they are most believable — a layering query ("does Theory
+// depend on Examples?") reads as authoritative and is not.
+//
+// The rule only fires when BOTH endpoints sit in modules this build knows, so a
+// file that failed to compile, or a directory outside the Lean library, is left
+// alone rather than silently stripped.
+
+/** `Sanctions.Theory.Foo` -> `Sanctions/Theory/Foo.lean`, matching node paths. */
+const moduleToPath = (m) => `${m.split('.').join('/')}.lean`;
+
+/** Node paths use the host separator; module paths never do. */
+const fwd = (p) => String(p).split(String.fromCharCode(92)).join('/');
+
+const pathToModule = new Map();
+for (const m of directImports.keys()) pathToModule.set(moduleToPath(m), m);
+
+/**
+ * Transitive import closure, memoised. Lean forbids import cycles.
+ *
+ * `complete` is false when the walk hit a module this build has no `.ilean`
+ * for, which means its own imports are unknown and the closure may be missing
+ * branches. Pruning on a truncated closure would delete real edges, so callers
+ * must skip those source modules entirely. Dependency modules (mathlib, core)
+ * are expected to be absent and are not the concern — only a module whose
+ * declarations are IN the index can be a prune target, and those all have
+ * `.ilean` files or the build did not succeed.
+ */
+const closureCache = new Map();
+function importClosure(mod) {
+  const hit = closureCache.get(mod);
+  if (hit) return hit;
+  const seen = new Set();
+  let complete = true;
+  const stack = [...(directImports.get(mod) ?? [])];
+  while (stack.length) {
+    const next = stack.pop();
+    if (seen.has(next)) continue;
+    seen.add(next);
+    const imports = directImports.get(next);
+    // Unknown module: only truncating if something in the index lives there.
+    if (imports === undefined) {
+      if (indexedModules.has(next)) complete = false;
+      continue;
+    }
+    for (const d of imports) if (!seen.has(d)) stack.push(d);
+  }
+  const result = { modules: seen, complete };
+  closureCache.set(mod, result);
+  return result;
+}
+
+/** Modules that actually hold indexed nodes — the only possible prune targets. */
+const indexedModules = new Set();
+for (const r of db.prepare('SELECT DISTINCT file_path FROM nodes').all()) {
+  const m = pathToModule.get(fwd(r.file_path));
+  if (m) indexedModules.add(m);
+}
+
+/** name -> [{id, module}] for every node that could be a citation target. */
+const candidatesByName = new Map();
+for (const r of db
+  .prepare("SELECT id, name, file_path FROM nodes WHERE kind IN ('function','struct','enum','class','field')")
+  .all()) {
+  const bucket = candidatesByName.get(r.name);
+  const entry = { id: r.id, module: pathToModule.get(fwd(r.file_path)) };
+  if (bucket) bucket.push(entry);
+  else candidatesByName.set(r.name, [entry]);
+}
+
+let impossible = [];
+let repoint = [];
+let skippedTruncated = 0;
+
+/**
+ * Find every citation edge whose target module the source module cannot reach.
+ *
+ * Run AFTER the enrichment rows are inserted, deliberately: `resolveName`'s
+ * short-name fallback can land on a same-named declaration in an unreachable
+ * module, and this is the check that catches it. Measured at 96 of 30,060
+ * added edges (0.3%) — small, but they are exactly the wrong-target kind this
+ * pass exists to remove, so it must police its own output too.
+ */
+function findImpossible() {
+  impossible = [];
+  repoint = [];
+  skippedTruncated = 0;
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.provenance, e.source, e.kind, e.line, e.col,
+              s.file_path AS sf, t.file_path AS tf, s.name AS sn, t.name AS tn
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+        WHERE e.kind IN ('calls','instantiates','references')`
+    )
+    .all();
+  for (const r of rows) {
+    const srcMod = pathToModule.get(fwd(r.sf));
+    const tgtMod = pathToModule.get(fwd(r.tf));
+    if (!srcMod || !tgtMod || srcMod === tgtMod) continue;
+    const closure = importClosure(srcMod);
+    if (!closure.complete) { skippedTruncated++; continue; }
+    if (closure.modules.has(tgtMod)) continue;
+    // The citation is real — a token was written — but it landed on a module
+    // the source cannot see. If exactly ONE declaration of that name is
+    // reachable, that is necessarily the one meant, so move the edge instead of
+    // dropping it. Deleting would lose the dependency altogether, and a lost
+    // dependency reads as "safe to change" — the direction that costs most.
+    const reachable = (candidatesByName.get(r.tn) ?? []).filter(
+      (c) => c.module && (c.module === srcMod || closure.modules.has(c.module))
+    );
+    if (reachable.length === 1) {
+      repoint.push({
+        id: r.id, to: reachable[0].id,
+        source: r.source, kind: r.kind, line: r.line, col: r.col,
+      });
+    }
+    else impossible.push(r);
+  }
+}
+if (!noPrune) findImpossible();
+
 const existing = new Set(
   db
     .prepare("SELECT source, target, line FROM edges WHERE kind IN ('calls','instantiates','references')")
@@ -181,6 +331,45 @@ console.log(`[ilean]   target outside the index (core/mathlib): ${unresolvedTarg
 console.log(`[ilean]   enclosing declaration not in the index: ${unresolvedSource}`);
 console.log(`[ilean]   self-references skipped: ${selfRefs}`);
 console.log(`[ilean]   NOT already present as an edge: ${fresh.length}`);
+if (!noPrune) {
+  const bySrc = new Map();
+  for (const r of impossible) {
+    const k = `${fwd(r.sf)} -> ${fwd(r.tf)}`;
+    bySrc.set(k, (bySrc.get(k) ?? 0) + 1);
+  }
+  const fromIlean = impossible.filter((r) => r.provenance === 'ilean').length;
+  console.log(`[ilean] IMPOSSIBLE edges (target module not in the source module's import closure): ${impossible.length + repoint.length}`);
+  console.log(`[ilean]   re-pointed to the one reachable declaration of that name: ${repoint.length}`);
+  console.log(`[ilean]   deleted (no reachable declaration of that name): ${impossible.length}`);
+  console.log(`[ilean]   across ${bySrc.size} file pair(s); ${fromIlean} of them from this script's own output`);
+  if (skippedTruncated) {
+    console.log(`[ilean]   ${skippedTruncated} edge(s) left alone: their module's import closure is incomplete`);
+  }
+  for (const [pair, n] of [...bySrc.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)) {
+    console.log(`[ilean]     ${n.toString().padStart(4)}  ${pair}`);
+  }
+}
+
+
+// Drop enrichment rows that the import graph forbids BEFORE writing them.
+// `resolveName`'s short-name fallback can land on a same-named declaration in a
+// module the source cannot reach; inserting those and deleting them again in
+// the prune below worked, but made every run redo the same 96 rows.
+let misresolved = 0;
+if (!noPrune) {
+  for (const [key, e] of [...pending.entries()]) {
+    const sm = pathToModule.get(fwd(nodeFile.get(e.source)));
+    const tm = pathToModule.get(fwd(nodeFile.get(e.target)));
+    if (!sm || !tm || sm === tm) continue;
+    const closure = importClosure(sm);
+    if (!closure.complete || closure.modules.has(tm)) continue;
+    pending.delete(key);
+    misresolved++;
+  }
+  if (misresolved) {
+    console.log(`[ilean]   ${misresolved} enrichment row(s) dropped: name resolved into an unreachable module`);
+  }
+}
 
 if (dryRun) {
   console.log('[ilean] --dry-run: nothing written');
@@ -196,6 +385,29 @@ try {
      VALUES (?, ?, 'calls', NULL, ?, ?, 'ilean')`
   );
   for (const e of pending.values()) insert.run(e.source, e.target, e.line, e.col);
+
+  // Prune LAST, over the table the enrichment just wrote, so the pass polices
+  // its own output as well as the extractor's. Doing it first left 96
+  // mis-resolved enrichment edges behind and made a second run find work to do.
+  if (!noPrune) {
+    findImpossible();
+    const drop = db.prepare('DELETE FROM edges WHERE id = ?');
+    for (const r of impossible) drop.run(r.id);
+    // Delete-then-insert rather than UPDATE: `idx_edges_identity` makes
+    // (source, target, kind, line, col) unique, so an UPDATE onto an edge that
+    // already exists silently does nothing and leaves the WRONG row in place.
+    const add = db.prepare(
+      `INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
+       VALUES (?, ?, ?, NULL, ?, ?, 'ilean-repoint')`
+    );
+    for (const r of repoint) {
+      drop.run(r.id);
+      add.run(r.source, r.to, r.kind, r.line, r.col);
+    }
+    console.log(
+      `[ilean] pruned after insert: deleted ${impossible.length}, re-pointed ${repoint.length}`
+    );
+  }
   db.exec('COMMIT');
 } catch (err) {
   db.exec('ROLLBACK');
@@ -205,4 +417,4 @@ try {
 
 const after = db.prepare("SELECT count(*) AS n FROM edges WHERE provenance = 'ilean'").get();
 console.log(`[ilean] wrote ${after.n} edges tagged provenance='ilean' (replaced ${priorRow.n})`);
-console.log("[ilean] re-indexing drops these — re-run after `codegraph index`");
+console.log("[ilean] re-indexing drops these — re-run after `codegraph index` (`sync` is fine)");

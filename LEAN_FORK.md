@@ -222,17 +222,39 @@ contains it — the edge set this extractor spends its heuristics approximating.
 
 ```bash
 lake build                                     # .ilean is a build artifact
-node scripts/lean-ilean-enrich.mjs . --dry-run # see what it would add
-node scripts/lean-ilean-enrich.mjs .
+node scripts/lean-ilean-enrich.mjs . --dry-run # see what it would change
+node scripts/lean-ilean-enrich.mjs .           # add elaborated edges, prune impossible ones
+node scripts/lean-ilean-enrich.mjs . --no-prune  # add only, change nothing existing
 ```
+
+### It prunes as well as adds
+
+`directImports` is the real module graph, and Lean forbids import cycles. If module B is not in
+module A's transitive import closure then nothing in A can name anything in B — not through
+elaboration, not through a macro. Any such edge is a resolver artifact, so the pass removes it:
+
+- **re-pointed** when exactly one declaration of that name is reachable — the citation is real and
+  that is necessarily the one meant, so the dependency moves rather than disappearing;
+- **deleted** when no declaration of that name is reachable at all.
+
+Two safeguards. The rule only fires when both endpoints sit in modules this build knows, and a
+closure that hit a module with no `.ilean` is treated as incomplete and skipped, so a file that
+failed to compile is left alone rather than silently stripped. Pruning also runs **after** the
+enrichment writes, so the pass polices its own output: `resolveName`'s short-name fallback lands in
+an unreachable module for about 0.3% of rows, and those are dropped before insert.
+
+Measured on the same 259-file development: 1,420 impossible edges deleted, 311 re-pointed, 96
+enrichment rows suppressed, and **spurious `Theory/`+`Foundations/` → `Examples/` edges 13 → 0**
+against an import graph that says there are none. No declaration lost its last inbound edge.
 
 Measured on a 259-file development, against the source-only index:
 
 | | source only | + `.ilean` |
 |---|---|---|
-| dependency edges | 59,366 | 89,192 (+17,188 new, 0 removed) |
-| zero-inbound declarations | 1,594 (30.5%) | 1,386 (26.5%) |
+| dependency edges | 59,735 | 88,279 (+17,619 added, 1,619 impossible removed) |
+| zero-inbound declarations | 1,602 (30.4%) | 1,387 (26.3%) |
 | false "unused" vs elaboration | 249 (15.6%) | 41 (3.0%) |
+| spurious cross-layer edges | 13 | **0** |
 
 26.5% is essentially the floor: `.ilean` itself says 25.4% of this project's declarations are cited
 by nothing else in it.
@@ -324,7 +346,12 @@ points toward *go ahead*. Do not use a source-only zero-inbound as the safety co
 or a deletion: run the `.ilean` enrichment first, and confirm with `lake build` regardless.
 
 Resolution is also **name-based, not import-scoped**: a reference resolves to a same-named node
-anywhere in the project. Where two structures share a field name, the edge can land in the wrong
-file. Measured on a 259-file development after the bound-name fix: 13 such edges remain, all of
-them field-name collisions. So a *layering* query — "does Theory depend on Examples?" — is the one
-question to verify against the import graph rather than trust outright.
+anywhere in the project, so where two structures share a field name the edge can land in the wrong
+file. That makes a *layering* query — "does `Theory/` depend on `Examples/`?" — read as
+authoritative when it is not, which is the worst place for a wrong answer.
+
+**The `.ilean` enrichment below fixes this**, because `directImports` is the real module graph: an
+edge whose target module is not in the source module's transitive import closure cannot exist, and
+is deleted or re-pointed. On a 259-file development that took spurious `Theory/`+`Foundations/` →
+`Examples/` edges from 13 to **0**. Without a build, the caveat stands and the import graph is the
+thing to check.
