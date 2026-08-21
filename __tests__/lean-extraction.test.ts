@@ -463,6 +463,50 @@ describe('Lean 4 extraction', () => {
     expect(citedNames(cg, reader!.id)).not.toContain('hidden_field');
   });
 
+  it('recovers a declaration whose own header opens an unparseable span', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-col0-'));
+
+    // The ERROR-span rescue skipped any header found before the span's first
+    // newline, a guard written for spans that begin MID-LINE, where the leading
+    // text starts at an arbitrary column. But a span that begins at column 0 is
+    // a declaration header that failed to parse, and its own first line is the
+    // likeliest thing to rescue. Skipping it discarded exactly one declaration
+    // per catastrophic span — invisible, because every OTHER declaration in the
+    // file still extracted.
+    //
+    // The cost was not one node. `affine_sender_chord_on` had no node at all,
+    // so its five call sites could not attach to anything, and the tool
+    // reported zero consumers for a theorem read by five witness files. That
+    // read as a dot-notation blind spot; it was a missing declaration.
+    //
+    // HONEST LIMIT: like the calc and where-struct tests, this pins the
+    // CONTRACT and not the parser state. The real trigger needed ~70 lines of
+    // surrounding context — verified by slicing the reporting file, which does
+    // reproduce, and by two synthetic reductions that do not. Measured instead
+    // on corpora: +36 declarations on the reporting development, +105 on a
+    // 3,655-file mathlib slice, +5 on batteries, none lost anywhere.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Cascade.lean'),
+      'namespace Demo\n' +
+        '\n' +
+        '    p.SomeCombinedChordOn D xT sbar :=\n' +
+        '  p.someDecompositionHelper hxT_mem\n' +
+        '    (dlo := p.delta) (by rw [hF]; exact someLowerChord p.delta)\n' +
+        '\n' +
+        '/-- The declaration whose header opens the span. -/\n' +
+        'theorem recoveredAtColumnZero (n : Nat) : True := trivial\n' +
+        '\n' +
+        'theorem afterIt : True := trivial\n' +
+        '\n' +
+        'end Demo\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+    const fns = cg.getNodesByKind('function').map((n) => n.name);
+    expect(fns).toContain('recoveredAtColumnZero');
+    expect(fns).toContain('afterIt');
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

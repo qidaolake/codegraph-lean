@@ -1114,16 +1114,26 @@ function rescueFromErrorSpan(
 ): void {
   const text = ctx.source.slice(err.startIndex, err.endIndex);
   const baseLine = err.startPosition.row;
-  // The ERROR may begin mid-line; only offsets after the first newline are
-  // reliably at column 0 relative to the file.
-  const firstNewline = text.indexOf('\n');
-  if (firstNewline < 0) return;
+  // An ERROR that begins MID-LINE cannot have its first line trusted: the
+  // text before the first newline starts at some arbitrary column, so a
+  // `theorem` matched there is really a fragment of the enclosing line.
+  //
+  // But an ERROR that begins at column 0 is a declaration header that failed
+  // to parse, and its own first line is the most likely thing to rescue.
+  // Skipping it unconditionally discarded exactly that declaration — one
+  // theorem per catastrophic span, invisible because every OTHER declaration
+  // in the file still extracted. It cost `affine_sender_chord_on` its node
+  // entirely, and with it all five of its call sites, which then read as a
+  // dot-notation blind spot rather than a missing declaration.
+  const startsMidLine = err.startPosition.column > 0;
+  const firstNewline = text.indexOf(NEWLINE);
+  if (firstNewline < 0 && startsMidLine) return;
 
   const found: Array<{ line: number; kind: NodeKind; name: string }> = [];
   RESCUE_HEADER.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = RESCUE_HEADER.exec(text)) !== null) {
-    if (m.index < firstNewline) continue;
+    if (startsMidLine && m.index < firstNewline) continue;
     const keyword = m[1] as string;
     const kind = RESCUE_KINDS.get(keyword);
     if (!kind) continue;

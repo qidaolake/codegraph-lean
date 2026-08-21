@@ -181,6 +181,28 @@ from source alone (dot notation needs types, macro-generated names do not exist 
 comparison, Python and Go projects indexed the ordinary way resolve 26–44%, so partial resolution is
 codegraph's normal regime, not a Lean problem.
 
+## Keeping the index current during a refactor
+
+`codegraph index` rebuilds from scratch and is not what you want mid-refactor. **`codegraph sync`
+re-indexes only what changed** — measured at **1.2 s for one edited file** on a 259-file
+development, which is fast enough to run on every save.
+
+```bash
+codegraph sync .        # seconds, not minutes
+codegraph status .      # what the index currently believes
+```
+
+The MCP server also runs a file watcher that syncs automatically, so an agent querying the index
+mid-edit is usually reading current data. It is worth knowing which of the two you are relying on:
+a query answered from a stale full index during a refactor describes **the tree you had, not the one
+you are changing**, and for a "is anything still reading this?" question that error points the
+dangerous way — a missing consumer always reads as *safe to move*.
+
+`sync` preserves `provenance='ilean'` edges except for the files it re-indexed, whose edges it
+correctly drops as stale. The `.ilean` files themselves only refresh on `lake build`, so the honest
+order during a refactor is: edit → `sync` (fast, or automatic) → `lake build` → re-run the enrich
+script.
+
 ## Optional: enrich the index from `.ilean` (the elaborated reference graph)
 
 The extractor records what the source text **names**. That is the right contract for an index that
@@ -286,10 +308,20 @@ instead recovers a similar number of declarations and takes spurious cross-layer
 158, because field names like `F_mem` and `hFsc` exist in several structures at once.
 
 What remains uncovered is a projection whose head has no written-down type: `fun x => x.val`, a
-`have`-bound term, or a head whose type is a variable. For those the answer is still elaboration.
-So **a lemma consumed only through an untyped projection still reports as uncited** — treat a
-zero-inbound result as "no *textual* citation the extractor can attribute", and grep `\.name\b`
-before concluding anything is dead.
+`have`-bound term, a head typed by a variable, or — the common case in a witness file — a head that
+is a top-level **definition** rather than a binder (`b2Params.affine_sender_chord_on`, where
+`b2Params` is a `def` elsewhere). For those the answer is elaboration: the `.ilean` enrichment
+below.
+
+So **a lemma consumed only through an untyped projection still reports as uncited** in a
+source-only index. Treat a zero-inbound result as "no *textual* citation the extractor can
+attribute", and grep `\.name\b` before concluding anything is dead.
+
+**The error is one-directional, and that matters more than its size.** A projection the extractor
+cannot attribute always removes a consumer, never invents one, so a source-only graph systematically
+*understates* how depended-upon a declaration is. For "what breaks if I change this?" the bias
+points toward *go ahead*. Do not use a source-only zero-inbound as the safety condition for a move
+or a deletion: run the `.ilean` enrichment first, and confirm with `lake build` regardless.
 
 Resolution is also **name-based, not import-scoped**: a reference resolves to a same-named node
 anywhere in the project. Where two structures share a field name, the edge can land in the wrong
