@@ -1028,8 +1028,18 @@ function sourceLineOf(node: SyntaxNode, source: string): string {
  * at the start of its line inside a section); the same words appearing inside an
  * expression, a tactic block or a docstring are indented or mid-line.
  */
+// The name may sit on the NEXT line, indented — Lean allows
+//
+//   private theorem
+//       someVeryLongName
+//
+// and requiring it on the keyword's line matched with NO name, which reads as
+// an anonymous declaration and is skipped. One line break plus indentation is
+// allowed; more would start matching unrelated identifiers after a blank line.
+// The line-break branch must come FIRST: alternation is ordered, and `[ 	]*`
+// matches empty, after which the optional name group happily captures nothing.
 const RESCUE_HEADER =
-  /^(?:@\[[^\]]*\][ \t]*)*(?:private |protected |noncomputable |partial |unsafe |scoped |local )*(theorem|lemma|def|abbrev|instance|structure|class|inductive|axiom|opaque|example)\b[ \t]*([A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*)?/gm;
+  /^(?:@\[[^\]]*\][ \t]*)*(?:private |protected |noncomputable |partial |unsafe |scoped |local )*(theorem|lemma|def|abbrev|instance|structure|class|inductive|axiom|opaque|example)\b(?:[ \t]*\r?\n[ \t]+|[ \t]*)([A-Za-z_À-￿][A-Za-z0-9_'!?.À-￿]*)?/gm;
 
 const RESCUE_KINDS: ReadonlyMap<string, NodeKind> = new Map<string, NodeKind>([
   ['theorem', 'function'], ['lemma', 'function'], ['def', 'function'],
@@ -1255,7 +1265,17 @@ function rescueFromErrorSpan(
   const endLine = err.endPosition.row;
   for (let i = 0; i < found.length; i++) {
     const entry = found[i]!;
-    const until = i + 1 < found.length ? found[i + 1]!.line : endLine + 1;
+    // Stop at the next header of ANY kind, not merely the next RESCUED one.
+    // A header the rescue skipped because it is already extracted belongs to a
+    // node that emits its own citations, so running past it would attribute
+    // that node's references to this one. (Skipping past a header nobody owns
+    // is the failure this used to have; `declLines` covers every header, owned
+    // or not, so neither case is orphaned now.)
+    let until = i + 1 < found.length ? found[i + 1]!.line : endLine + 1;
+    for (let row = entry.line + 1; row < until; row++) {
+      if (declLines.has(row) && !seenLines.has(row)) continue;
+      if (declLines.has(row)) { until = row; break; }
+    }
     // The namespace open at THIS declaration's own line, not at the span's
     // start — a span can cross a `namespace`/`end`, and a root-level span
     // starts before every namespace in the file.
@@ -1580,8 +1600,17 @@ export const leanExtractor: LanguageExtractor = {
 
     while (blocks.length > 0) closeBlock();
 
-    // A root that failed to parse holds declarations no walk can see.
-    if (node.type !== 'module') pendingRescue.push(node);
+    // Sweep the WHOLE file last, whatever the root parsed as.
+    //
+    // A failed root obviously holds declarations no walk can see, but so does
+    // a SUCCESSFUL one: an equation-style body can over-run and swallow its
+    // successors without producing an ERROR anywhere. `integrand_pointwise_diff`
+    // parses cleanly with a span of 144..255 and takes
+    // `bellmanBCF_monotone_pointwise` at line 230 down with it — no ERROR span
+    // covers that line, so the rescue never looked. Sweeping the root finds it,
+    // and costs nothing on files that parsed properly: every header already
+    // extracted is in `seenLines` and is skipped.
+    pendingRescue.push(node);
 
     // Rescue runs last: `parsedLines` must be complete first, so a declaration
     // the grammar handled is never duplicated by the text scan.

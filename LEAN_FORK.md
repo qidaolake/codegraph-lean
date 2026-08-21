@@ -129,6 +129,8 @@ Deliberately small, to keep upstream releases cheap to absorb:
  ?? src/extraction/languages/lean.ts        the extractor (~1,130 lines)
  ?? src/extraction/wasm/tree-sitter-lean.wasm
  ?? __tests__/lean-extraction.test.ts       precision contract for the dependency graph
+ ?? scripts/lean-ilean-enrich.mjs           optional: elaborated edges from `lake build`
+ ?? scripts/lean-completeness.mjs           optional: extractor completeness vs `.ilean`
 ```
 
 **Three shared files, eight inserted lines.** Every registration entry is inserted *mid-list* next to
@@ -297,6 +299,26 @@ SELECT e.provenance, count(*) FROM edges e
    AND s.file_path LIKE '%Theory%' AND t.file_path LIKE '%Examples%'
  GROUP BY 1;
 ```
+
+### Measuring extractor completeness
+
+`.ilean` also lists, per module, the exact set of declarations that module contains — so
+"how many does the extractor miss?" is a set difference rather than a sample:
+
+```bash
+node scripts/lean-completeness.mjs .            # report
+node scripts/lean-completeness.mjs . --max=0    # exit 1 if anything is missing (CI)
+node scripts/lean-completeness.mjs . --json     # every missing name
+```
+
+It excludes what is *expected* to differ rather than counting it: `_private.A.B.0.` mangling,
+Lean's auto-generated `instFooBar` instance names, compiler-synthesised members (`.mk`, `.rec`,
+`.noConfusion`, …) and macro auxiliaries (`_aux_…`). What remains is a real miss.
+
+Currently **0 of 7,609** on a 148-file development and **3 of 5,179** on a 259-file one — and those
+three name declarations that no longer exist in the source, i.e. a stale build rather than a miss.
+The oracle is only as current as `lake build`; if a reported name does not appear in its file at
+all, rebuild before believing the number.
 
 ## Rebuilding the grammar
 
