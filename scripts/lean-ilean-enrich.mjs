@@ -57,7 +57,9 @@
 //     `name-matcher.ts` — both high-churn upstream files this fork otherwise
 //     does not touch. Deliberately not done; see LEAN_FORK.md.
 //
-//   - It also PRUNES impossible edges (see below). `--no-prune` disables that.
+//   - It also PRUNES impossible edges: those whose target module is outside the
+//     source module's import closure, and those pointing from Lean into another
+//     language. `--no-prune` disables that.
 //
 // Usage: node scripts/lean-ilean-enrich.mjs [projectRoot] [--dry-run] [--no-prune]
 
@@ -121,10 +123,19 @@ const byShort = new Map();
 // those citations were silently dropped. Invisible until the namespace fix made
 // qualified names correct enough to start colliding.
 const TARGET_KINDS = "('function','struct','enum','class','field','method','constant')";
+// Every name in a `.ilean` is a LEAN name. Resolving one onto a node in another
+// language is never right, and the short-name fallback did exactly that: Lean's
+// `And.left` misses on qualified name, falls back to the tail `left`, and finds
+// a unique Python function called `left` in an archived analysis script. `left`
+// and `right` are among the most-used accessors in Lean, so this scaled: 4,262
+// fictional Lean -> Python edges on one project, polluting every OUTBOUND
+// dependency query while leaving inbound ones clean.
+const LEAN_ONLY = "language = 'lean'";
 
 const nodeFile = new Map();
 for (const row of db
-  .prepare(`SELECT id, name, qualified_name, file_path FROM nodes WHERE kind IN ${TARGET_KINDS}`)
+  .prepare(`SELECT id, name, qualified_name, file_path FROM nodes
+             WHERE kind IN ${TARGET_KINDS} AND ${LEAN_ONLY}`)
   .all()) {
   if (row.qualified_name) {
     const bucket = byQualified.get(row.qualified_name);
@@ -291,7 +302,8 @@ for (const r of db.prepare('SELECT DISTINCT file_path FROM nodes').all()) {
 /** name -> [{id, module}] for every node that could be a citation target. */
 const candidatesByName = new Map();
 for (const r of db
-  .prepare(`SELECT id, name, file_path FROM nodes WHERE kind IN ${TARGET_KINDS}`)
+  .prepare(`SELECT id, name, file_path FROM nodes
+             WHERE kind IN ${TARGET_KINDS} AND ${LEAN_ONLY}`)
   .all()) {
   const bucket = candidatesByName.get(r.name);
   const entry = { id: r.id, module: pathToModule.get(fwd(r.file_path)) };
@@ -319,12 +331,21 @@ function findImpossible() {
   const rows = db
     .prepare(
       `SELECT e.id, e.provenance, e.source, e.kind, e.line, e.col,
-              s.file_path AS sf, t.file_path AS tf, s.name AS sn, t.name AS tn
+              s.file_path AS sf, t.file_path AS tf, s.name AS sn, t.name AS tn,
+              s.language AS sl, t.language AS tl
          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
         WHERE e.kind IN ('calls','instantiates','references')`
     )
     .all();
   for (const r of rows) {
+    // A Lean declaration cannot cite a Python function. The import-closure rule
+    // below cannot see these — it needs BOTH endpoints in modules this build
+    // knows, and a `.py` file has no Lean import closure to test against — so
+    // cross-language edges out of Lean are rejected on their own terms.
+    //
+    // Only OUT of Lean: an FFI declaration in another language may legitimately
+    // name a Lean symbol, and this pass has no business judging that direction.
+    if (r.sl === 'lean' && r.tl && r.tl !== 'lean') { impossible.push(r); continue; }
     const srcMod = pathToModule.get(fwd(r.sf));
     const tgtMod = pathToModule.get(fwd(r.tf));
     if (!srcMod || !tgtMod || srcMod === tgtMod) continue;

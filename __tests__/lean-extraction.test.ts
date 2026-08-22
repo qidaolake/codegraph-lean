@@ -594,6 +594,49 @@ describe('Lean 4 extraction', () => {
     expect(after!.qualifiedName).toBe('Demo.afterMutual');
   });
 
+  it('never resolves a Lean reference to a same-named symbol in another language', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-xlang-'));
+    fs.mkdirSync(path.join(tmpDir, 'docs'));
+
+    // Lean has no FFI that resolves by bare name, so a Lean reference matching a
+    // same-named symbol in another language is always coincidence — and the
+    // coincidences are the common words: `left`, `right`, `map`, `comp`.
+    // Measured on one project, 4,262 fictional Lean → Python edges, every
+    // OUTBOUND dependency query polluted while inbound ones looked clean.
+    //
+    // The analysis scripts that collided were archived artifacts under `docs/`,
+    // but the fix is not "exclude docs" — a Lean declaration cannot cite a
+    // Python function wherever the Python lives.
+    fs.writeFileSync(
+      path.join(tmpDir, 'Main.lean'),
+      'namespace Demo\n' +
+        '\n' +
+        'theorem useHelper : True := by\n' +
+        '  exact compute_the_bound\n' +
+        '\n' +
+        'end Demo\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'docs', 'probe.py'),
+      'def compute_the_bound(x):\n    return x + 1\n'
+    );
+
+    const cg = await indexFixture(tmpDir);
+
+    const pyNode = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'compute_the_bound' && n.language === 'python');
+    expect(pyNode).toBeDefined(); // the Python file IS indexed…
+    expect(citationsTo(cg, pyNode!.id)).toBe(0); // …but Lean never reaches it
+
+    const lean = cg.getNodesByKind('function').find((n) => n.name === 'useHelper');
+    expect(lean).toBeDefined();
+    for (const target of cg.getOutgoingEdges(lean!.id)) {
+      if (!CITES.has(target.kind)) continue;
+      expect(cg.getNode(target.target)?.language).toBe('lean');
+    }
+  });
+
   it('records a sorry as a dependency so unproven lemmas are a graph query', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-lean-sorry-'));
     fs.writeFileSync(

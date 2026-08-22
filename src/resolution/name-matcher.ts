@@ -187,6 +187,14 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  // Lean names only Lean. The language has no FFI that resolves by bare name,
+  // so a Lean reference matching a same-named symbol in another language is
+  // always coincidence — and the coincidences are common ones: `left`, `right`,
+  // `map`, `comp`. Measured on one project, 4,262 fictional Lean -> Python
+  // edges, every outbound dependency query polluted. The general `calls` path
+  // below deliberately allows cross-language edges (FFI, framework bridges), so
+  // this is scoped to Lean rather than applied to every language.
+  if (ref.language === 'lean') return candidates.filter((c) => c.language === 'lean');
   if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }

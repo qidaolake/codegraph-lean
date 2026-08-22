@@ -126,6 +126,7 @@ Deliberately small, to keep upstream releases cheap to absorb:
  M src/types.ts                      +1    'lean' in the LANGUAGES union
  M src/extraction/grammars.ts        +6    wasm file, .lean extension, display name, vendored set
  M src/extraction/languages/index.ts +2    import + EXTRACTORS entry
+ M src/resolution/name-matcher.ts    +2    a Lean reference resolves only to Lean
  ?? src/extraction/languages/lean.ts        the extractor (~1,130 lines)
  ?? src/extraction/wasm/tree-sitter-lean.wasm
  ?? __tests__/lean-extraction.test.ts       precision contract for the dependency graph
@@ -133,7 +134,15 @@ Deliberately small, to keep upstream releases cheap to absorb:
  ?? scripts/lean-completeness.mjs           optional: extractor completeness vs `.ilean`
 ```
 
-**Three shared files, eight inserted lines.** Every registration entry is inserted *mid-list* next to
+**Four shared files, ten inserted lines.** Three are pure registration. The fourth is a correctness
+guard that has nowhere else to live: name resolution allows cross-language matches on purpose (FFI,
+framework bridges), but Lean has no FFI that resolves by bare name, so a Lean reference matching a
+same-named symbol in another language is always coincidence — and the coincidences are common words
+(`left`, `right`, `map`, `comp`). One project measured 4,262 fictional Lean → Python edges into
+archived analysis scripts, which polluted every outbound dependency query. The guard is one early
+return keyed on `ref.language === 'lean'`, so no other language can reach it.
+
+Every registration entry is inserted *mid-list* next to
 `kotlin`, never appended at the end — upstream appends new languages at the tail, so appending there
 too would collide on every release. Tests live in `__tests__/lean-extraction.test.ts` rather than
 upstream's high-churn `__tests__/extraction.test.ts`, for the same reason.
